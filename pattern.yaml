@@ -1,4 +1,4 @@
-# Run python main.py --add to create your first pattern.
+# Run uv run --locked python main.py --add to create your first pattern.
 # Example (remove the final {} if uncommenting):
 # "a1b2c3d4":
 #   pattern: ['^example_\d+$', 's/^download_(.*)$/\1/']

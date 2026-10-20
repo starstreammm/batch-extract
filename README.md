@@ -9,42 +9,50 @@ PyYAML **6.0**, Rich **13.3.1**, and Pydantic **2.9.2** for configuration valida
 
 Install `uv` and a 7-Zip executable supporting 7z, RAR, and ZIP. Make
 `7z` or `7zz` available on your PATH, or pass `--seven-zip /path/to/7zz`.
-Use `uv` to install Python 3.11.9, create the environment, and install dependencies
-from `requirements.txt`. Run these commands from the project directory:
+`pyproject.toml` defines the project and its dependencies; `uv.lock` locks the
+resolved versions. Run these commands from the project directory:
 
 ```sh
 uv python install 3.11.9
-uv venv --python 3.11.9 .venv
-uv pip install -r requirements.txt
-source .venv/bin/activate
-python --version                 # should print Python 3.11.9
-python main.py --help
+uv sync --locked
+uv run --locked python --version  # should print Python 3.11.9
+uv run --locked python main.py --help
 ```
 
-On Windows, replace `source .venv/bin/activate` with `.venv\Scripts\activate`
-(cmd) or `.venv\Scripts\Activate.ps1` (PowerShell).
+`uv sync` creates and manages `.venv`; `uv run` uses it without shell activation,
+including on Windows. `.python-version` and `requires-python` select **3.11.9**.
+Keep `pyproject.toml` and `uv.lock` in version control. After changing dependencies
+in `pyproject.toml`, run `uv lock`, then `uv sync --locked`.
+The Python dependencies do not install 7-Zip.
 
-The supplied `.python-version` pins Python to **3.11.9**. `requirements.txt` remains
-the dependency source; after editing it, run `uv pip install -r requirements.txt`
-again. `uv pip install` discovers the project's `.venv`, so activation is only
-needed for the plain `python` commands below. The Python dependencies do not
-install 7-Zip.
+### Optional requirements.txt workflow
+
+`requirements.txt` is an optional export of the lockfile for tools that need it.
+Regenerate it after updating `uv.lock`:
+
+```sh
+uv export --locked --format requirements.txt --no-hashes --output-file requirements.txt
+```
+
+For an environment managed separately, dependencies can instead be installed with
+`python -m pip install -r requirements.txt` using Python 3.11.9. Edit dependencies
+in `pyproject.toml`, not in the generated export.
 
 ## Quick start
 
 ```sh
 # The supplied pattern.yaml is empty. Create a rule interactively:
-python main.py --add
+uv run --locked python main.py --add
 
 # Recognize and extract, including child folders, keeping originals:
-python main.py -p ./downloads -o ./unpacked -c -s
+uv run --locked python main.py -p ./downloads -o ./unpacked -c -s
 
 # Without -s, successfully extracted original archives/volumes are deleted:
-python main.py -p ./downloads -o ./unpacked
+uv run --locked python main.py -p ./downloads -o ./unpacked
 
-python main.py --list
-python main.py --delete a1b2c3d4
-python main.py --config ./private-patterns.yaml --add
+uv run --locked python main.py --list
+uv run --locked python main.py --delete a1b2c3d4
+uv run --locked python main.py --config ./private-patterns.yaml --add
 ```
 
 `--add` asks for regexes one at a time, archive type, layer count, and passwords.
@@ -190,7 +198,7 @@ also eligible for matching, so a separate output directory is usually clearer.
 ## Tests and layout
 
 ```sh
-python -m unittest discover -s tests -v
+uv run --locked python -m unittest discover -s tests -v
 ```
 
 Tests use the standard library. Integration tests generate real ZIP/7z archives
@@ -198,6 +206,9 @@ and exercise external 7-Zip; they are skipped if neither `7z` nor `7zz` is on PA
 RAR grouping is unit-tested; RAR extraction uses the same external execution path.
 
 - `main.py`: entry point.
+- `pyproject.toml`: project metadata and pinned direct dependencies.
+- `uv.lock`: resolved dependencies for the primary uv workflow.
+- `requirements.txt`: optional generated dependency export.
 - `src/config.py`: validated YAML loading/saving and UIDs.
 - `src/matching.py`: regex and substitution parsing.
 - `src/recognize.py`: scanning, suffix handling, multipart grouping.

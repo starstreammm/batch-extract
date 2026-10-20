@@ -1,0 +1,14 @@
+[project]
+name = "batch-extract"
+version = "0.1.0"
+description = "Sequential archive extraction with regex rules and Rich progress."
+readme = "README.md"
+requires-python = "==3.11.9"
+dependencies = [
+    "PyYAML==6.0",
+    "rich==13.3.1",
+    "pydantic==2.9.2",
+]
+
+[tool.uv]
+package = false

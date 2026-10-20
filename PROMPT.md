@@ -4,11 +4,14 @@ Build a batch archive extractor targeting **Python 3.11.9**.
 
 Use `pathlib` for paths, `argparse` for arguments, Rich for terminal tables/progress,
 and external 7-Zip through `asyncio.create_subprocess_exec`. Extract sequentially.
-Use **uv** to manage Python and the `.venv` environment. Pin Python with
-`.python-version`, create the environment with `uv venv --python 3.11.9 .venv`,
-and install dependencies with `uv pip install -r requirements.txt`.
-Keep `requirements.txt` as the dependency source, pinned to **Rich 13.3.1**,
-**PyYAML 6.0**, and **Pydantic 2.9.2**. Use Pydantic for configuration validation.
+Use **uv** project management with `pyproject.toml` and a generated `uv.lock`.
+Pin Python to **3.11.9** in `.python-version` and `requires-python`. Use
+`uv sync --locked` for the environment and `uv run --locked python main.py` to run.
+Define dependencies in `pyproject.toml`, pinned to **Rich 13.3.1**, **PyYAML 6.0**,
+and **Pydantic 2.9.2**. Use Pydantic for configuration validation.
+Keep `requirements.txt` only as an optional export, generated with
+`uv export --locked --format requirements.txt --no-hashes --output-file requirements.txt`.
+After dependency changes, regenerate `uv.lock` and the optional export.
 Keep usage instructions in `README.md`.
 
 Place implementation modules (`cli.py`, `config.py`, `matching.py`,
