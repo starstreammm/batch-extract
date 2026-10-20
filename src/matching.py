@@ -28,6 +28,51 @@ class Rule:
         return renamed
 
 
+def translate_basic_regex(pattern: str) -> str:
+    """Translate sed-style grouping/quantifiers, leaving character classes intact."""
+    result = []
+    in_class = False
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\" and index + 1 < len(pattern):
+            following = pattern[index + 1]
+            if not in_class and following in "()+?{}|":
+                result.append(following)
+            else:
+                result.append(char + following)
+            index += 2
+            continue
+        if char == "[" and not in_class:
+            in_class = True
+        elif char == "]" and in_class:
+            in_class = False
+        if not in_class and char in "()+?{}|":
+            result.append("\\" + char)
+        else:
+            result.append(char)
+        index += 1
+    return "".join(result)
+
+
+def compile_substitution(pattern: str, replacement: str, flags: int) -> re.Pattern:
+    try:
+        regex = re.compile(pattern, flags)
+        regex.sub(replacement, "")
+        return regex
+    except re.error as original:
+        # Python regexes remain the default. Retry basic regex syntax only when
+        # an escaped capture group cannot satisfy a replacement backreference.
+        if "invalid group reference" not in str(original) or r"\(" not in pattern:
+            raise
+        try:
+            regex = re.compile(translate_basic_regex(pattern), flags)
+            regex.sub(replacement, "")
+            return regex
+        except re.error:
+            raise original
+
+
 def parse_rule(value: str) -> Rule:
     # s/regex/replacement/ or s|regex|replacement|; escaped delimiters are literal.
     if len(value) >= 2 and value[0] == "s" and value[1] in "/|#~":
@@ -50,9 +95,9 @@ def parse_rule(value: str) -> Rule:
                         raise ValueError(
                             "Substitution accepts only an optional i flag."
                         )
-                    regex = re.compile(parts[0], re.IGNORECASE if flags == "i" else 0)
-                    # Compile replacement references even when there is no match.
-                    regex.sub(parts[1], "")
+                    regex = compile_substitution(
+                        parts[0], parts[1], re.IGNORECASE if flags == "i" else 0
+                    )
                     return Rule(regex, parts[1])
             else:
                 current.append(ch)

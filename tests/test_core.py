@@ -41,6 +41,16 @@ class CoreTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 parse_rule(value).apply("a")
 
+    def test_sed_basic_substitution(self):
+        rule = parse_rule(r"s/\([a-zA-Z]\+\)\.7z\.exe$/\1.7z.001/")
+        self.assertEqual(rule.apply("Example.7z.exe"), "Example.7z.001")
+        self.assertIsNone(rule.apply("123.7z.exe"))
+        self.assertEqual(parse_rule(r"s/\(ab\)\{2\}$/\1/").apply("abab"), "ab")
+        # Valid Python patterns with literal parentheses retain their meaning.
+        self.assertEqual(parse_rule(r"s/\(ab\)/literal/").apply("(ab)"), "literal")
+        with self.assertRaises(re.error):
+            parse_rule(r"s/\(ab\)/\2/")
+
     def test_config_roundtrip_password_reuse(self):
         path = self.root / "config.yaml"
         pattern = Pattern("ab12", r"s/^x(.*)$/\1/", 3, ("123", "last"), "7z")

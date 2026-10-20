@@ -16,6 +16,7 @@ class Part:
     scheme: str
     index: int
     suffix: str
+    target_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -121,6 +122,11 @@ def groups(
             # Matching is allowed without a type or recognizable signature.
             # 7-Zip will determine whether the selected file is an archive.
             parts.append(Part(path, path.name, "", "plain", 0, ""))
+    return collect_parts(parts)
+
+
+def collect_parts(parts: list[Part]) -> list[Archive]:
+    """Group source paths using their planned archive names, without renaming files."""
     legacy = {(p.path.parent, p.base, p.kind) for p in parts if p.scheme == "legacy"}
     collected: dict[tuple, list[Part]] = {}
     for part in parts:
@@ -159,35 +165,57 @@ def recognize(
     conflicted: set[Path] = set()
     for pattern in patterns:
         rule = parse_rule(pattern.pattern)
+        planned_parts = []
+        matched: set[Path] = set()
+        inconsistent: set[Path] = set()
         for archive in groups(files, pattern.type, include_unknown=True):
             renamed_bases = set()
-            staged_parts = archive.parts
-            staged_kind = archive.kind
+            replacements = {}
             for part in archive.parts:
                 subject, suffix = match_name(part.path.name, pattern.type)
                 renamed = rule.apply(subject)
                 if renamed is None:
                     continue
-                # Reattach only what matching stripped, then normalize the
-                # archive/volume name for staging. Never append a second .zip.
+                matched.add(part.path)
                 full_name = renamed + suffix
                 renamed_part = describe_name(
                     part.path.with_name(full_name), archive.kind or None
                 )
                 renamed_bases.add(renamed_part.base if renamed_part else full_name)
-                if len(archive.parts) == 1 and part.scheme == "plain" and renamed_part:
-                    staged_parts = (replace(
-                        part, base=renamed_part.base,
-                        kind=renamed_part.kind, suffix=renamed_part.suffix,
-                    ),)
-                    staged_kind = renamed_part.kind
+                if rule.replacement is not None:
+                    replacements[part.path] = (full_name, renamed_part)
             if not renamed_bases:
+                planned_parts.extend(archive.parts)
                 continue
-            error = archive.error
             if len(renamed_bases) > 1:
-                error = "Replacement produces inconsistent basenames across volumes."
+                inconsistent.update(p.path for p in archive.parts)
             renamed = sorted(renamed_bases)[0]
+            for part in archive.parts:
+                if len(archive.parts) == 1 and part.scheme == "plain" and replacements:
+                    full_name, described = replacements[part.path]
+                    planned_parts.append(replace(
+                        described or part, path=part.path, base=renamed,
+                        target_name=full_name if full_name != part.path.name else None,
+                    ))
+                elif replacements:
+                    # A match on one volume renames the entire group's base.
+                    original_suffix = part.path.name[len(part.base):]
+                    target = renamed + original_suffix
+                    planned_parts.append(replace(
+                        part, base=renamed,
+                        target_name=target if target != part.path.name else None,
+                    ))
+                else:
+                    planned_parts.append(part)
+        # A renamed first volume (e.g. .7z.exe -> .7z.001) now joins its siblings.
+        for archive in collect_parts(planned_parts):
             key = tuple(p.path for p in archive.parts)
+            if not matched.intersection(key):
+                continue
+            if inconsistent.intersection(key):
+                archive = replace(
+                    archive, error="Replacement produces inconsistent basenames across volumes."
+                )
             overlap = next(
                 (other for old, other in selected.items() if set(old) & set(key)), None
             )
@@ -198,10 +226,7 @@ def recognize(
                 conflicted.update(key)
                 conflicted.update(p.path for p in overlap.parts)
             else:
-                selected[key] = replace(
-                    archive, parts=staged_parts, name=renamed, kind=staged_kind,
-                    pattern=pattern, error=error,
-                )
+                selected[key] = replace(archive, pattern=pattern)
     return [
         a for key, a in selected.items() if not conflicted.intersection(key)
     ], errors

@@ -106,7 +106,8 @@ archive does not stop unrelated archive groups.
   With no `type`, the whole filename is always matched.
 - `type` is a naming hint, not a filter: a `type: 7z` rule can match a ZIP file
   using a regex that includes `.zip`. Actual extraction uses 7-Zip format detection.
-  Known or hinted suffixes are restored on temporary copies of extensionless files.
+  Extensionless files are passed directly to 7-Zip; use a replacement rule if a
+  particular filename suffix is needed.
   A matched file with no recognizable format is still attempted by 7-Zip;
   failed extraction retains the original.
 - Volume grouping is independent of matching. Each volume filename is considered;
@@ -118,14 +119,25 @@ archive does not stop unrelated archive groups.
   matching. Delimiters `/`, `|`, `#`, and `~` are supported. Backreferences such as
   `\1` and `\g<name>` work. All occurrences are replaced, as with `re.sub`.
   Escape a literal delimiter with `\`. Paths and empty names are rejected.
+  Sed-style escaped capture groups and quantifiers are also accepted when a
+  replacement backreference cannot be resolved as a Python regex. For example:
+  `s/\([a-zA-Z]\+\)\.7z\.exe$/\1.7z.001/`.
+  Enter **single backslashes** at the interactive prompt or inside YAML single
+  quotes; do not double them as you would in a JSON string. This is compatibility
+  for basic regex captures/quantifiers, not a complete sed command interpreter.
 - If multiple UIDs match the same
   archive/volume group, it is reported as ambiguous and retained, without extraction.
-- Renames affect **temporary copies only**. For example,
-  with `type: zip`, `s/^download_(.+)$/\1/` stages `download_demo.zip` as `demo.zip` and uses `demo`
+- Renames happen **in place in the source directory**. For example,
+  with `type: zip`, `s/^download_(.+)$/\1/` renames `download_demo.zip` to `demo.zip` and uses `demo`
   as the fallback output folder name. A sole folder already inside the archive
-  keeps its own name. With `-s`, the original retains its original filename.
+  keeps its own name. If extraction or output placement fails, original filenames
+  are restored. On success, `-s` retains the files under their renamed names;
+  without `-s`, successful inputs are deleted. Existing rename destinations are
+  never intentionally overwritten; collisions fail the group.
   A stripped suffix is reattached after substitution. Without `type`, write
   substitutions against the full filename, e.g. `s/^download_(.+)\.zip$/\1.zip/`.
+  Planned names are grouped before files are changed: renaming `demo.7z.exe` to
+  `demo.7z.001` joins it with existing `demo.7z.002`, `.003`, and later volumes.
 - `layer` is a positive integer: `1` extracts the outer archive, `2` also extracts
   archives inside it, and so on. Inner formats are detected independently and may
   differ from `type`. Regexes apply only to the outer archive.
@@ -198,15 +210,25 @@ installed 7-Zip must support the specific multipart format. RAR extraction needs
 a RAR-capable build. The utility cannot create RAR archives. Multipart groups are
 listed and handled once; after success, deletion covers all recognized volumes.
 
-All temporary archive copies, intermediate layers, and staged extraction results
-are stored under `OUTPUT/temp/`. The entire `temp` directory is removed when the
-run finishes, including handled failures or cancellation. Allow space there for
-copies, intermediate layers, and all extracted results until the ending stage.
-An existing `OUTPUT/temp` is left untouched and blocks extraction; move or remove
-it before retrying. A forced process kill or power loss can leave this directory
-behind. `temp` is reserved during extraction, so an output folder with that name
-is published as `temp (2)` (or the next available number).
-Partial output is removed after failure. Nonzero
+7-Zip reads original files directly from their source directories. Input archives
+are never copied or moved into temporary storage. Single-layer extraction writes
+directly into a newly reserved output folder and does not create `OUTPUT/temp`.
+After extraction, a sole root folder is normalized as described above.
+
+Only runs containing a rule with `layer > 1` create `OUTPUT/temp/`, and only
+intermediate extracted layers are stored there. The last layer is extracted into
+its output folder. Intermediate sidecar files are moved into the final tree.
+The owned `temp` directory is removed when the run finishes, including handled
+failures or cancellation. An existing `OUTPUT/temp` blocks multilayer extraction
+and is left untouched; single-layer extraction can proceed alongside it.
+During multilayer runs, `temp` is reserved, so a final folder of that name becomes
+`temp (2)` (or the next available number). Single-layer runs can produce a final
+folder named `temp` normally.
+
+Partial output is removed after failure, and source renames are rolled back.
+Successful `-s` runs retain the renamed source files. A forced process kill or
+power loss can leave intermediate output and renamed sources behind.
+Nonzero
 7-Zip exits, including warnings, count as failures. Source files changed during
 extraction are retained. Deletion errors are reported with the number of volumes
 actually deleted, and successfully published output remains available.

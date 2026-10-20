@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -30,6 +31,8 @@ from .extract import (
     identity,
     publish,
     staging_directory,
+    SourceNames,
+    reserve_directory,
 )
 from .matching import parse_rule
 from .recognize import Archive, recognize, walk_files
@@ -156,6 +159,23 @@ class Result:
     destination: Path | None = None
     error: str = ""
     disposition: str = "retained"
+    sources: Archive | None = None
+    names: SourceNames | None = None
+
+
+def cleanup_unpublished(result: Result) -> None:
+    if result.destination is None and result.payload is not None and result.payload.exists():
+        shutil.rmtree(result.payload)
+
+
+def fail_result(result: Result, error: Exception) -> None:
+    result.error = str(error)
+    try:
+        if result.names is not None:
+            result.names.restore()
+    except (OSError, ExtractionError) as exc:
+        result.error += f"\nFilename restoration failed: {exc}"
+    cleanup_unpublished(result)
 
 
 async def extract_batch(args, patterns: list[Pattern], console: Console) -> int:
@@ -207,10 +227,15 @@ async def extract_batch(args, patterns: list[Pattern], console: Console) -> int:
         )
     output.mkdir(parents=True, exist_ok=True)
     results = []
-    with staging_directory(output) as temporary:
+    with ExitStack() as stack:
+        temporary = (
+            stack.enter_context(staging_directory(output))
+            if any(archive.pattern.layer > 1 for archive in archives)
+            else None
+        )
         extractor = Extractor(str(executable), temporary)
         console.print(
-            "Extracting one archive group at a time; originals remain until the ending step."
+            "Extracting directly from source files; failed renames are restored."
         )
         with Progress(
             SpinnerColumn(),
@@ -233,17 +258,20 @@ async def extract_batch(args, patterns: list[Pattern], console: Console) -> int:
                     )
 
                 try:
-                    result.snapshots = {
-                        part.path: identity(part.path) for part in archive.parts
-                    }
-                    result.payload = await extractor.extract(
-                        archive,
+                    result.names = stack.enter_context(SourceNames())
+                    result.sources = result.names.prepare(archive)
+                    result.snapshots = result.names.snapshots
+                    result.payload = reserve_directory(output, archive.name)
+                    stack.callback(cleanup_unpublished, result)
+                    await extractor.extract(
+                        result.sources,
                         archive.pattern.layer,
                         archive.pattern.passwords,
                         update,
+                        destination=result.payload,
                     )
                 except (OSError, ExtractionError, ValueError) as exc:
-                    result.error = str(exc)
+                    fail_result(result, exc)
                     progress.update(
                         task, description=f"{archive.primary.name} · FAILED"
                     )
@@ -273,7 +301,7 @@ async def extract_batch(args, patterns: list[Pattern], console: Console) -> int:
                         )
                     removed = 0
                     try:
-                        for part in result.archive.parts:
+                        for part in result.sources.parts:
                             part.path.unlink()
                             removed += 1
                     finally:
@@ -281,9 +309,12 @@ async def extract_batch(args, patterns: list[Pattern], console: Console) -> int:
                             f"deleted {removed}/{len(result.archive.parts)} volume(s)"
                         )
                 else:
-                    result.disposition = "saved (-s)"
+                    result.disposition = "saved (-s): " + ", ".join(
+                        part.path.name for part in result.sources.parts
+                    )
+                result.names.committed = True
             except (OSError, ExtractionError) as exc:
-                result.error = str(exc)
+                fail_result(result, exc)
             result.seconds += perf_counter() - tick
         report = Table("Archive", "Result / originals", "Where", "Time")
         for result in results:
@@ -342,7 +373,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             return asyncio.run(extract_batch(args, patterns, console))
         return 0
-    except (ConfigError, OSError, ValueError, re.error) as exc:
+    except (ConfigError, ExtractionError, OSError, ValueError, re.error) as exc:
         console.print(Text(f"Error: {exc}", style="red"))
         return 1
     except (KeyboardInterrupt, EOFError):

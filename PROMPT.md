@@ -16,9 +16,14 @@ Keep usage instructions in `README.md`.
 
 Place implementation modules (`cli.py`, `config.py`, `matching.py`,
 `recognize.py`, and `extract.py`) in `src/`. Keep `main.py` as the root entry point.
-Store all temporary copies and intermediate extraction files in `OUTPUT/temp/`
-and remove this directory when the run finishes, including failures or cancellation.
-Do not delete a pre-existing `OUTPUT/temp`; report it and stop extraction instead.
+Read original archives directly: never copy or move inputs into temporary storage.
+Apply replacement renames in their source directory, restoring original filenames
+on failure or cancellation. After success, `-s` retains renamed inputs; otherwise
+delete them. Refuse rename collisions. Single-layer output goes directly into its
+output folder. Create `OUTPUT/temp/` only for runs with `layer > 1`, storing only
+intermediate extracted layers there; final layers go to output. Remove the owned
+temp directory on completion/failure/cancellation. A pre-existing temp blocks
+multilayer runs but is left untouched by single-layer runs.
 
 `pattern.yaml` is a mapping from automatically generated short hex UID to:
 
@@ -33,6 +38,9 @@ Do not delete a pre-existing `OUTPUT/temp`; report it and stop extraction instea
 User clarification: patterns must be regular expressions and may include a
 replacement to rename before extraction. Current syntax is Python `re.search`
 for normal regexes and `s/regex/replacement/` (optional `i`) for substitutions.
+Support sed-style escaped captures/quantifiers as a fallback for otherwise-invalid
+replacement backreferences, e.g. `s/\([a-zA-Z]\+\)\.7z\.exe$/\1.7z.001/`.
+Use single backslashes in interactive input and YAML single-quoted strings.
 `pattern` must be a single string, never a list. For each file and rule, strip
 only the configured `.<type>` suffix if the filename ends with it (case-insensitive).
 Otherwise match the whole filename, including any suffix. With `type` omitted,
@@ -40,7 +48,8 @@ always match the whole filename. A mismatched type never excludes a file.
 Never match directory paths. Volume grouping is separate: test each volume name
 and extract its complete group once if any volume matches. Thus `foo.7z.001`
 is matched in full even with `type: 7z`; `foo.part01.rar` becomes `foo.part01`
-with `type: rar`. Rename only temporary copies and reattach any stripped suffix.
+with `type: rar`. Reattach any stripped suffix after substitution. Group planned
+names before extraction so a renamed `.7z.exe` -> `.7z.001` joins existing siblings.
 Use format detection when no type is supplied. Regexes do not select layers.
 
 Required CLI:

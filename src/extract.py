@@ -1,9 +1,10 @@
-"""Async 7-Zip execution, staged extraction, and collision-safe publication."""
+"""Direct async 7-Zip extraction, reversible source renames, and output placement."""
 
 import asyncio
 from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import shutil
@@ -119,18 +120,19 @@ def publish(payload: Path, output: Path, name: str) -> Path:
     """Preserve a sole root directory; otherwise wrap contents in archive name."""
     entries = list(payload.iterdir())
     root = entries[0] if len(entries) == 1 and entries[0].is_dir() else payload
+    if payload.parent == output:
+        if root == payload:
+            return payload
+        if root.name in (name, payload.name) and not (root / root.name).exists():
+            for entry in root.iterdir():
+                entry.rename(payload / entry.name)
+            root.rmdir()
+            return payload
     desired = root.name if root != payload else name
     if desired in ("", ".", "..") or "/" in desired or "\\" in desired:
         raise ExtractionError("Invalid output folder name.")
     output.mkdir(parents=True, exist_ok=True)
-    number = 1
-    while True:
-        destination = output / (desired if number == 1 else f"{desired} ({number})")
-        try:
-            destination.mkdir()
-            break
-        except FileExistsError:
-            number += 1
+    destination = reserve_directory(output, desired)
     moved = []
     try:
         for entry in root.iterdir():
@@ -141,7 +143,24 @@ def publish(payload: Path, output: Path, name: str) -> Path:
             (destination / filename).rename(root / filename)
         destination.rmdir()
         raise
+    if payload.parent == output:
+        root.rmdir()
+        payload.rmdir()
     return destination
+
+
+def reserve_directory(output: Path, name: str) -> Path:
+    if not name or name in (".", "..") or "/" in name or "\\" in name:
+        raise ExtractionError("Invalid output folder name.")
+    output.mkdir(parents=True, exist_ok=True)
+    number = 1
+    while True:
+        destination = output / (name if number == 1 else f"{name} ({number})")
+        try:
+            destination.mkdir()
+            return destination
+        except FileExistsError:
+            number += 1
 
 
 def identity(path: Path) -> tuple[int, int, int, int]:
@@ -149,8 +168,72 @@ def identity(path: Path) -> tuple[int, int, int, int]:
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
 
 
+class SourceNames:
+    """Rename inputs in their own directories and roll back uncommitted work."""
+
+    def __init__(self):
+        self.moves: list[tuple[Path, Path]] = []
+        self.snapshots: dict[Path, tuple[int, int, int, int]] = {}
+        self.committed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        if not self.committed:
+            self.restore()
+
+    def prepare(self, archive: Archive) -> Archive:
+        if archive.error:
+            raise ExtractionError(archive.error)
+        targets = [
+            part.path.with_name(part.target_name) if part.target_name else part.path
+            for part in archive.parts
+        ]
+        if len(set(targets)) != len(targets):
+            raise ExtractionError("Rename would give multiple volumes the same filename.")
+        # Preflight the whole group before modifying any source.
+        for part, target in zip(archive.parts, targets):
+            if target != part.path and (target.exists() or target.is_symlink()):
+                raise ExtractionError(f"Rename destination already exists: {target}")
+        originals = {part.path: identity(part.path) for part in archive.parts}
+        renamed = []
+        for part, target in zip(archive.parts, targets):
+            self.snapshots[target] = originals[part.path]
+            if target != part.path:
+                part.path.rename(target)
+                self.moves.append((part.path, target))
+            renamed.append(replace(part, path=target, target_name=None))
+        return replace(archive, parts=tuple(renamed))
+
+    def restore(self) -> None:
+        while self.moves:
+            original, current = self.moves[-1]
+            # A deletion failure can leave some volumes already deleted.
+            if current.exists() or current.is_symlink():
+                if original.exists() or original.is_symlink():
+                    raise ExtractionError(f"Cannot restore filename; path is occupied: {original}")
+                if identity(current)[:2] != self.snapshots[current][:2]:
+                    raise ExtractionError(f"Cannot restore replaced source file: {current}")
+                current.rename(original)
+            self.moves.pop()
+
+
+def move_sidecars(source: Path, destination: Path, archives: set[Path]) -> None:
+    """Move only extracted sidecars into the final tree; leave inner archives in temp."""
+    for entry in source.iterdir():
+        if entry in archives:
+            continue
+        target = destination / entry.name
+        if entry.is_dir():
+            target.mkdir()
+            move_sidecars(entry, target, archives)
+        else:
+            entry.rename(target)
+
+
 class Extractor:
-    def __init__(self, executable: str, workspace: Path):
+    def __init__(self, executable: str, workspace: Path | None):
         self.executable = executable
         self.workspace = workspace
 
@@ -161,26 +244,20 @@ class Extractor:
         passwords: tuple[str, ...],
         progress: Callable[[int, int], None],
         depth: int = 0,
+        *,
+        destination: Path,
     ) -> Path:
         if archive.error:
             raise ExtractionError(archive.error)
-        work = Path(tempfile.mkdtemp(prefix="layer-", dir=self.workspace))
-        inputs, payload = work / "input", work / "payload"
-        inputs.mkdir()
-        payload.mkdir()
-        first = None
-        for part in archive.parts:
-            target = inputs / (archive.name + part.suffix)
-            if target.exists():
-                raise ExtractionError(
-                    f"Conflicting staged archive names: {target.name}"
-                )
-            shutil.copy2(part.path, target)
-            if first is None:
-                first = target
+        if depth + 1 == layers:
+            payload = destination
+        else:
+            if self.workspace is None:
+                raise ExtractionError("Nested extraction requires an intermediate directory.")
+            payload = Path(tempfile.mkdtemp(prefix="layer-", dir=self.workspace))
         password = passwords[min(depth, len(passwords) - 1)] if passwords else ""
         # A bare -p prompts; closed stdin prevents a missing password from hanging.
-        common = ["-y", "-sccUTF-8", f"-w{work}", f"-p{password}", "--", str(first)]
+        common = ["-y", "-sccUTF-8", f"-w{payload}", f"-p{password}", "--", str(archive.primary)]
         await run_7z(
             self.executable,
             ["l", "-slt", "-ba", *common],
@@ -204,11 +281,18 @@ class Extractor:
         nested_files = {p.path for a in nested for p in a.parts}
         # A single wrapped archive can be unwrapped without accumulating containers.
         if len(nested) == 1 and set(files) == nested_files:
-            return await self.extract(nested[0], layers, passwords, progress, depth + 1)
+            return await self.extract(
+                nested[0], layers, passwords, progress, depth + 1,
+                destination=destination,
+            )
         # Multiple archives and sidecar files are retained in their original directories.
+        move_sidecars(payload, destination, nested_files)
         for inner in nested:
-            result = await self.extract(inner, layers, passwords, progress, depth + 1)
-            publish(result, inner.primary.parent, inner.name)
-            for part in inner.parts:
-                part.path.unlink()
-        return payload
+            parent = destination / inner.primary.parent.relative_to(payload)
+            inner_destination = reserve_directory(parent, inner.name)
+            result = await self.extract(
+                inner, layers, passwords, progress, depth + 1,
+                destination=inner_destination,
+            )
+            publish(result, parent, inner.name)
+        return destination

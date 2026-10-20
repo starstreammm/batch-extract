@@ -69,8 +69,13 @@ class IntegrationTests(unittest.TestCase):
         async def inspected(extractor, *args, **kwargs):
             self.assertEqual(extractor.workspace, self.output.resolve() / "temp")
             self.assertTrue(extractor.workspace.is_dir())
+            archive = args[0]
+            if len(args) > 4:  # Recursive calls read intermediate archives.
+                self.assertTrue(archive.primary.is_relative_to(extractor.workspace))
+            else:
+                self.assertTrue(archive.primary.is_relative_to(self.source.resolve()))
             payload = await original(extractor, *args, **kwargs)
-            self.assertTrue(payload.is_relative_to(self.output.resolve() / "temp"))
+            self.assertEqual(payload.parent, self.output.resolve())
             workspaces.append(payload)
             return payload
 
@@ -89,10 +94,11 @@ class IntegrationTests(unittest.TestCase):
         temporary = self.output / "temp"
         temporary.mkdir(parents=True)
         (temporary / "keep.txt").write_text("existing")
-        with self.assertRaisesRegex(ValueError, "Temporary path already exists"):
-            self.run_batch()
+        self.assertEqual(self.run_batch(save=True), 0, self.log.getvalue())
         self.assertEqual((temporary / "keep.txt").read_text(), "existing")
         self.assertTrue(archive.exists())
+        with self.assertRaisesRegex(ValueError, "Temporary path already exists"):
+            self.run_batch(Pattern("a", "^sample$", 2, (), "zip"))
 
     def test_temp_is_cleaned_on_cancellation(self):
         archive = self.zip("sample.zip", {"file.txt": "data"})
@@ -103,22 +109,132 @@ class IntegrationTests(unittest.TestCase):
 
         with patch.object(Extractor, "extract", cancelled):
             with self.assertRaises(asyncio.CancelledError):
-                self.run_batch()
+                self.run_batch(Pattern("a", "^sample$", 2, (), "zip"))
         self.assertFalse((self.output / "temp").exists())
         self.assertTrue(archive.exists())
 
     def test_final_folder_named_temp_is_preserved(self):
         self.zip("sample.zip", {"temp/file.txt": "data"})
         self.assertEqual(self.run_batch(), 0, self.log.getvalue())
-        self.assertEqual((self.output / "temp (2)/file.txt").read_text(), "data")
-        self.assertFalse((self.output / "temp").exists())
+        self.assertEqual((self.output / "temp/file.txt").read_text(), "data")
 
     def test_extensionless_rename_and_save(self):
         archive = self.zip("download_sample", {"file.txt": "hello"})
+        original_inode = archive.stat().st_ino
         pattern = Pattern("abc", r"s/^download_(.*)$/\1/", 1, (), "zip")
         self.assertEqual(self.run_batch(pattern, save=True), 0, self.log.getvalue())
-        self.assertTrue(archive.exists())
+        self.assertFalse(archive.exists())
+        self.assertEqual((self.source / "sample").stat().st_ino, original_inode)
         self.assertEqual((self.output / "sample/file.txt").read_text(), "hello")
+
+    def test_single_layer_reads_original_and_never_creates_temp(self):
+        archive = self.zip("sample.zip", {"file.txt": "hello"})
+        original_inode = archive.stat().st_ino
+        seen = []
+
+        async def inspected(executable, args, **kwargs):
+            self.assertFalse((self.output / "temp").exists())
+            self.assertEqual(Path(args[-1]), archive.resolve())
+            self.assertEqual(Path(args[-1]).stat().st_ino, original_inode)
+            seen.append(args[0])
+            return await run_7z(executable, args, **kwargs)
+
+        with patch("src.extract.run_7z", side_effect=inspected), patch(
+            "src.extract.shutil.copy2", side_effect=AssertionError("Must not copy inputs")
+        ):
+            self.assertEqual(self.run_batch(save=True), 0, self.log.getvalue())
+        self.assertEqual(seen, ["l", "x"])
+        self.assertTrue(archive.exists())
+        self.assertFalse((self.output / "temp").exists())
+
+    def test_failed_rename_is_restored(self):
+        archive = self.source / "download_sample.zip"
+        archive.write_bytes(b"invalid zip")
+        pattern = Pattern("a", r"s/^download_(.*)$/\1/", 1, (), "zip")
+        self.assertEqual(self.run_batch(pattern), 1)
+        self.assertEqual(archive.read_bytes(), b"invalid zip")
+        self.assertFalse((self.source / "sample.zip").exists())
+        self.assertFalse(list(self.output.iterdir()))
+
+    def test_rename_collision_preserves_both_files(self):
+        archive = self.zip("download_sample.zip", {"file": "new"})
+        existing = self.zip("sample.zip", {"file": "old"})
+        before = {p: p.read_bytes() for p in (archive, existing)}
+        pattern = Pattern("a", r"s/^download_(.*)$/\1/", 1, (), "zip")
+        self.assertEqual(self.run_batch(pattern), 1)
+        self.assertEqual({p: p.read_bytes() for p in before}, before)
+
+    def test_rename_restored_on_publication_failure(self):
+        archive = self.zip("download_sample.zip", {"file": "data"})
+        pattern = Pattern("a", r"s/^download_(.*)$/\1/", 1, (), "zip")
+        with patch("src.cli.publish", side_effect=OSError("cannot publish")):
+            self.assertEqual(self.run_batch(pattern), 1)
+        self.assertTrue(archive.exists())
+        self.assertFalse((self.source / "sample.zip").exists())
+        self.assertFalse(list(self.output.iterdir()))
+
+    def test_rename_restored_when_inner_layer_fails(self):
+        archive = self.zip("download_sample.zip", {"inner.zip": "invalid"})
+        before = archive.read_bytes()
+        pattern = Pattern("a", r"s/^download_(.*)$/\1/", 2, (), "zip")
+        self.assertEqual(self.run_batch(pattern), 1)
+        self.assertEqual(archive.read_bytes(), before)
+        self.assertFalse((self.source / "sample.zip").exists())
+        self.assertFalse(list(self.output.iterdir()))
+
+    def test_partial_volume_rename_is_rolled_back(self):
+        paths = [self.source / f"download_sample.7z.{index:03}" for index in (1, 2)]
+        for path in paths:
+            path.write_text("original")
+        original_rename = Path.rename
+
+        def fail_second(path, target):
+            if path == paths[1].resolve():
+                raise OSError("cannot rename second volume")
+            return original_rename(path, target)
+
+        pattern = Pattern("a", r"s/^download_(.*)$/\1/", 1, ())
+        with patch.object(Path, "rename", fail_second):
+            self.assertEqual(self.run_batch(pattern), 1)
+        self.assertEqual(set(self.source.iterdir()), set(paths))
+        self.assertTrue(all(path.read_text() == "original" for path in paths))
+
+    def test_rename_restored_on_cancellation(self):
+        archive = self.zip("download_sample.zip", {"file": "data"})
+        pattern = Pattern("a", r"s/^download_(.*)$/\1/", 1, (), "zip")
+
+        async def cancelled(extractor, *args, **kwargs):
+            self.assertFalse(archive.exists())
+            self.assertTrue((self.source / "sample.zip").exists())
+            (kwargs["destination"] / "partial").write_text("incomplete")
+            raise asyncio.CancelledError
+
+        with patch.object(Extractor, "extract", cancelled):
+            with self.assertRaises(asyncio.CancelledError):
+                self.run_batch(pattern)
+        self.assertTrue(archive.exists())
+        self.assertFalse((self.source / "sample.zip").exists())
+        self.assertFalse(list(self.output.iterdir()))
+
+    def test_basic_regex_renamed_first_volume_joins_siblings(self):
+        data = self.root / "data.bin"
+        data.write_bytes(bytes(range(256)) * 16)
+        asyncio.run(run_7z(
+            SEVEN_ZIP, ["a", "-mx=0", "-v1k", str(self.source / "sample.7z"), str(data)]
+        ))
+        first = self.source / "sample.7z.exe"
+        (self.source / "sample.7z.001").rename(first)
+        inode = first.stat().st_ino
+        pattern = Pattern("a", r"s/\([a-zA-Z]\+\)\.7z\.exe$/\1.7z.001/", 1, ())
+        self.assertEqual(self.run_batch(pattern, save=True), 0, self.log.getvalue())
+        self.assertEqual((self.source / "sample.7z.001").stat().st_ino, inode)
+        self.assertFalse(first.exists())
+        self.assertEqual((self.output / "sample/data.bin").read_bytes(), data.read_bytes())
+        self.assertFalse((self.output / "temp").exists())
+        # A subsequent ordinary split-volume extraction deletes the entire group.
+        self.assertEqual(self.run_batch(Pattern("b", r"^sample\.7z\.\d+$", 1, ())), 0,
+                         self.log.getvalue())
+        self.assertFalse(list(self.source.iterdir()))
 
     def test_optional_or_mismatched_type_full_filename(self):
         for kind in (None, "7z"):
