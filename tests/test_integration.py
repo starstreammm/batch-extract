@@ -47,7 +47,7 @@ class IntegrationTests(unittest.TestCase):
         console = Console(file=self.log, width=160, color_system=None)
         return asyncio.run(
             extract_batch(
-                args, [pattern or Pattern("abc", ("^sample$",), 1, (), "zip")], console
+                args, [pattern or Pattern("abc", "^sample$", 1, (), "zip")], console
             )
         )
 
@@ -76,7 +76,7 @@ class IntegrationTests(unittest.TestCase):
 
         with patch.object(Extractor, "extract", inspected):
             self.assertEqual(
-                self.run_batch(Pattern("abc", ("^sample$",), 2, (), "zip")),
+                self.run_batch(Pattern("abc", "^sample$", 2, (), "zip")),
                 0,
                 self.log.getvalue(),
             )
@@ -115,9 +115,24 @@ class IntegrationTests(unittest.TestCase):
 
     def test_extensionless_rename_and_save(self):
         archive = self.zip("download_sample", {"file.txt": "hello"})
-        pattern = Pattern("abc", (r"s/^download_(.*)$/\1/",), 1, (), "zip")
+        pattern = Pattern("abc", r"s/^download_(.*)$/\1/", 1, (), "zip")
         self.assertEqual(self.run_batch(pattern, save=True), 0, self.log.getvalue())
         self.assertTrue(archive.exists())
+        self.assertEqual((self.output / "sample/file.txt").read_text(), "hello")
+
+    def test_optional_or_mismatched_type_full_filename(self):
+        for kind in (None, "7z"):
+            with self.subTest(kind=kind):
+                archive = self.zip("download_sample.zip", {"file.txt": "hello"})
+                pattern = Pattern("a", r"s/^download_(.*)\.zip$/\1.zip/", 1, (), kind)
+                self.assertEqual(self.run_batch(pattern), 0, self.log.getvalue())
+                self.assertFalse(archive.exists())
+                self.assertEqual((self.output / "sample/file.txt").read_text(), "hello")
+                shutil.rmtree(self.output)
+
+    def test_extensionless_without_type(self):
+        self.zip("sample", {"file.txt": "hello"})
+        self.assertEqual(self.run_batch(Pattern("a", "^sample$", 1, ())), 0, self.log.getvalue())
         self.assertEqual((self.output / "sample/file.txt").read_text(), "hello")
 
     def test_multiple_folders(self):
@@ -145,7 +160,7 @@ class IntegrationTests(unittest.TestCase):
                     SEVEN_ZIP, ["a", "-psecret", "-mhe=on", str(archive), str(member)]
                 )
             )
-        pattern = Pattern("abc", ("^sample$",), 2, ("secret",), "7z")
+        pattern = Pattern("abc", "^sample$", 2, ("secret",), "7z")
         self.assertEqual(self.run_batch(pattern), 0, self.log.getvalue())
         self.assertEqual(
             (self.output / "sample/payload.txt").read_text(), "secret data"
@@ -160,7 +175,7 @@ class IntegrationTests(unittest.TestCase):
             {"one.zip": inner_bytes, "two.zip": inner_bytes, "readme.txt": "keep"},
         )
         self.assertEqual(
-            self.run_batch(Pattern("abc", ("^sample$",), 2, (), "zip")),
+            self.run_batch(Pattern("abc", "^sample$", 2, (), "zip")),
             0,
             self.log.getvalue(),
         )
@@ -177,7 +192,7 @@ class IntegrationTests(unittest.TestCase):
             part.rename(part.with_name(part.name.replace(".7z.", ".")))
         self.assertGreater(len(list(self.source.iterdir())), 1)
         self.assertEqual(
-            self.run_batch(Pattern("abc", ("^sample$",), 1, (), "7z")),
+            self.run_batch(Pattern("abc", r"^sample\.\d{3}$", 1, (), "7z")),
             0,
             self.log.getvalue(),
         )
@@ -194,7 +209,7 @@ class IntegrationTests(unittest.TestCase):
             run_7z(SEVEN_ZIP, ["a", "-psecret", "-mhe=on", str(archive), str(data)])
         )
         self.assertEqual(
-            self.run_batch(Pattern("abc", ("^sample$",), 1, ("wrong",), "7z")), 1
+            self.run_batch(Pattern("abc", "^sample$", 1, ("wrong",), "7z")), 1
         )
         self.assertTrue(archive.exists())
         self.assertFalse(list(self.output.iterdir()))
@@ -212,7 +227,7 @@ class IntegrationTests(unittest.TestCase):
             },
         )
         self.assertEqual(
-            self.run_batch(Pattern("abc", ("^sample$",), 2, (), "zip")),
+            self.run_batch(Pattern("abc", "^sample$", 2, (), "zip")),
             0,
             self.log.getvalue(),
         )
@@ -227,7 +242,7 @@ class IntegrationTests(unittest.TestCase):
         asyncio.run(run_7z(SEVEN_ZIP, ["a", "-mx=0", "-v1k", str(archive), str(data)]))
         (self.source / "sample.7z.002").unlink()
         remaining = set(self.source.iterdir())
-        self.assertEqual(self.run_batch(Pattern("abc", ("^sample$",), 1, (), "7z")), 1)
+        self.assertEqual(self.run_batch(Pattern("abc", r"^sample\.7z\.\d{3}$", 1, (), "7z")), 1)
         self.assertEqual(set(self.source.iterdir()), remaining)
 
     def test_no_password_does_not_hang(self):
@@ -243,7 +258,7 @@ class IntegrationTests(unittest.TestCase):
         async def bounded():
             return await asyncio.wait_for(
                 extract_batch(
-                    args, [Pattern("abc", ("^sample$",), 1, (), "7z")], console
+                    args, [Pattern("abc", "^sample$", 1, (), "7z")], console
                 ),
                 5,
             )
@@ -268,7 +283,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(self.run_batch(), 1)
         self.assertTrue(archive.exists())
         self.zip("sample.zip", {"file": "data"})
-        self.assertEqual(self.run_batch(Pattern("abc", ("^sample$",), 2, (), "zip")), 1)
+        self.assertEqual(self.run_batch(Pattern("abc", "^sample$", 2, (), "zip")), 1)
         self.assertTrue(archive.exists())
 
     def test_traversal_rejected(self):
@@ -302,7 +317,7 @@ class IntegrationTests(unittest.TestCase):
 
     def test_cli_management(self):
         config = self.root / "pattern.yaml"
-        save_patterns(config, [Pattern("abc", ("sample",), 1, (), "zip")])
+        save_patterns(config, [Pattern("abc", "sample", 1, (), "zip")])
         with patch("src.cli.Console", return_value=Console(file=io.StringIO())):
             self.assertEqual(main(["--config", str(config), "--list"]), 0)
             self.assertEqual(main(["--config", str(config), "--delete", "abc"]), 0)
@@ -313,7 +328,7 @@ class IntegrationTests(unittest.TestCase):
         console = Console(file=io.StringIO())
         with patch("src.cli.Console", return_value=console), patch(
             "src.cli.Prompt.ask",
-            side_effect=[r"s/^prefix_(.*)$/\1/", "", "7z", "secret"],
+            side_effect=[r"s/^prefix_(.*)$/\1/", "7z", "secret"],
         ), patch("src.cli.IntPrompt.ask", return_value=3), patch(
             "src.cli.Confirm.ask", return_value=True
         ):
@@ -321,6 +336,16 @@ class IntegrationTests(unittest.TestCase):
         pattern = load_patterns(config)[0]
         self.assertRegex(pattern.uid, "^[a-f0-9]{8}$")
         self.assertEqual(pattern.password(2), "secret")
+
+    def test_guided_add_without_type(self):
+        config = self.root / "pattern.yaml"
+        with patch("src.cli.Console", return_value=Console(file=io.StringIO())), patch(
+            "src.cli.Prompt.ask", side_effect=[r"^sample\.zip$", "auto", ""]
+        ), patch("src.cli.IntPrompt.ask", return_value=1):
+            self.assertEqual(main(["--config", str(config), "--add"]), 0)
+            self.assertEqual(main(["--config", str(config), "--list"]), 0)
+        self.assertIsNone(load_patterns(config)[0].type)
+        self.assertNotIn("type:", config.read_text())
 
 
 if __name__ == "__main__":

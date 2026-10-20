@@ -24,18 +24,24 @@ Do not delete a pre-existing `OUTPUT/temp`; report it and stop extraction instea
 
 ```yaml
 "a1b2c3d4":
-  pattern: ['^example$', 's/^download_(.*)$/\1/']
+  pattern: 's/^download_(.*)$/\1/'
   layer: 2
   password: ['outer', 'inner']
-  type: '7z'  # 7z | rar | zip
+  type: '7z'  # Optional: 7z | rar | zip; may be omitted or null.
 ```
 
 User clarification: patterns must be regular expressions and may include a
 replacement to rename before extraction. Current syntax is Python `re.search`
 for normal regexes and `s/regex/replacement/` (optional `i`) for substitutions.
-Patterns are alternatives matching the outer filename after stripping archive
-and volume suffixes, never directory paths. Rename only temporary copies; restore
-missing archive suffixes using `type`. Regexes do not select individual layers.
+`pattern` must be a single string, never a list. For each file and rule, strip
+only the configured `.<type>` suffix if the filename ends with it (case-insensitive).
+Otherwise match the whole filename, including any suffix. With `type` omitted,
+always match the whole filename. A mismatched type never excludes a file.
+Never match directory paths. Volume grouping is separate: test each volume name
+and extract its complete group once if any volume matches. Thus `foo.7z.001`
+is matched in full even with `type: 7z`; `foo.part01.rar` becomes `foo.part01`
+with `type: rar`. Rename only temporary copies and reattach any stripped suffix.
+Use format detection when no type is supplied. Regexes do not select layers.
 
 Required CLI:
 

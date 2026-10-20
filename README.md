@@ -55,8 +55,9 @@ uv run --locked python main.py --delete a1b2c3d4
 uv run --locked python main.py --config ./private-patterns.yaml --add
 ```
 
-`--add` asks for regexes one at a time, archive type, layer count, and passwords.
-Enter a blank regex after the last rule. It generates an eight-character hex UID.
+`--add` asks for one regex or replacement string, an optional archive type, layer
+count, and passwords. Choose `auto` (the default) to omit `type`.
+It generates an eight-character hex UID.
 Passwords are entered without terminal echo; later layers can reuse the last one.
 
 | Argument | Meaning |
@@ -80,39 +81,51 @@ archive does not stop unrelated archive groups.
 
 ```yaml
 "a1b2c3d4":
-  pattern:
-    - '^movie_\d+$'
-    - 's/^download_(.+)$/\1/'
+  pattern: 's/^download_(.+)$/\1/'
   layer: 2
   password: ['outer-password', 'inner-password']
   type: '7z'
 
 "e5f6a7b8":
-  pattern: ['(?i)^photos(?:_\d+)?$']
+  pattern: '(?i)^photos(?:_\d+)?\.zip$'
   layer: 1
   password: []
-  type: 'zip'
+  # type is optional; this rule matches the full filename.
 ```
 
-- `pattern` is a nonempty list of alternatives using **Python regular expressions**.
+- `pattern` is one nonempty string using **Python regular expressions**, optionally
+  in replacement form. Lists are rejected; use regex alternation (`foo|bar`) or
+  separate UID entries for alternatives.
   Matching uses `re.search`; add `^` and `$` to match the whole name. Matching is
   case-sensitive unless you use `(?i)` or a substitution's `i` flag.
-- Only the filename is considered, never its directory. The archive and volume
-  suffixes are removed first: `movie_12.7z.001` becomes `movie_12`.
-- `type` specifies the outer archive format and the suffix to restore if missing.
-  `movie_12` or split `movie_12.001` can therefore match the same rule as
-  `movie_12.7z`. An unrecognized suffix is part of the basename; remove it with a
-  substitution if desired, e.g. `s/\.download$//`.
+- Only the filename is considered, never its directory. `type` is optional
+  (`7z`, `rar`, or `zip`; omitted or `null` means automatic detection).
+  When a filename ends with the configured `.<type>` suffix, that suffix alone
+  is removed before matching. Suffix comparison is case-insensitive.
+  Otherwise the **whole filename** is matched, including any suffix.
+  With no `type`, the whole filename is always matched.
+- `type` is a naming hint, not a filter: a `type: 7z` rule can match a ZIP file
+  using a regex that includes `.zip`. Actual extraction uses 7-Zip format detection.
+  Known or hinted suffixes are restored on temporary copies of extensionless files.
+  A matched file with no recognizable format is still attempted by 7-Zip;
+  failed extraction retains the original.
+- Volume grouping is independent of matching. Each volume filename is considered;
+  a match on any volume selects the entire group once. For example, with
+  `type: 7z`, `movie_12.7z.001` is matched in full (it does not end in `.7z`);
+  use `^movie_12\.7z\.\d{3}$`. With `type: rar`, `movie.part01.rar` is matched
+  as `movie.part01`. Replacements must yield a consistent basename across volumes.
 - Renaming uses `s/REGEX/REPLACEMENT/`, with optional trailing `i` for case-insensitive
   matching. Delimiters `/`, `|`, `#`, and `~` are supported. Backreferences such as
   `\1` and `\g<name>` work. All occurrences are replaced, as with `re.sub`.
   Escape a literal delimiter with `\`. Paths and empty names are rejected.
-- The first matching alternative in one UID wins. If multiple UIDs match the same
+- If multiple UIDs match the same
   archive/volume group, it is reported as ambiguous and retained, without extraction.
 - Renames affect **temporary copies only**. For example,
-  `s/^download_(.+)$/\1/` stages `download_demo.zip` as `demo.zip` and uses `demo`
+  with `type: zip`, `s/^download_(.+)$/\1/` stages `download_demo.zip` as `demo.zip` and uses `demo`
   as the fallback output folder name. A sole folder already inside the archive
   keeps its own name. With `-s`, the original retains its original filename.
+  A stripped suffix is reattached after substitution. Without `type`, write
+  substitutions against the full filename, e.g. `s/^download_(.+)\.zip$/\1.zip/`.
 - `layer` is a positive integer: `1` extracts the outer archive, `2` also extracts
   archives inside it, and so on. Inner formats are detected independently and may
   differ from `type`. Regexes apply only to the outer archive.
@@ -126,6 +139,16 @@ archive does not stop unrelated archive groups.
 Passwords are stored as plaintext and displayed by `--list` and the recognizing
 step as requested. 7-Zip also receives them as process arguments. Use a private
 config file and avoid committing real passwords.
+
+Examples of the text passed to the regex:
+
+| Filename | Configured `type` | Text to match |
+| --- | --- | --- |
+| `report.7z` | `7z` | `report` |
+| `report.zip` | `7z` | `report.zip` |
+| `report.7z` | omitted | `report.7z` |
+| `report` | `7z` | `report` |
+| `report.7z.001` | `7z` | `report.7z.001` |
 
 ## Three stages
 

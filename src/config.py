@@ -41,14 +41,12 @@ UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _ma
 )
 class Pattern:
     uid: Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")]
-    patterns: Annotated[
-        tuple[Annotated[str, Field(min_length=1)], ...], Field(min_length=1)
-    ]
+    pattern: Annotated[str, Field(min_length=1)]
     layer: Annotated[int, Field(ge=1)]
     passwords: tuple[str, ...]
-    type: Literal["7z", "rar", "zip"]
+    type: Literal["7z", "rar", "zip"] | None = None
 
-    @field_validator("patterns", "passwords", mode="before")
+    @field_validator("passwords", mode="before")
     @classmethod
     def normalize_lists(cls, value):
         # YAML supplies lists; preserve immutable tuples internally.
@@ -69,12 +67,14 @@ class Pattern:
         )
 
     def record(self) -> dict:
-        return {
-            "pattern": list(self.patterns),
+        record = {
+            "pattern": self.pattern,
             "layer": self.layer,
             "password": list(self.passwords),
-            "type": self.type,
         }
+        if self.type is not None:
+            record["type"] = self.type
+        return record
 
 
 def load_patterns(path: Path) -> list[Pattern]:
@@ -90,23 +90,23 @@ def load_patterns(path: Path) -> list[Pattern]:
         raise ConfigError("Configuration must be a mapping of UID to pattern.")
     result = []
     for uid, value in data.items():
-        if not isinstance(value, dict) or set(value) != {
-            "pattern",
-            "layer",
-            "password",
-            "type",
-        }:
+        required = {"pattern", "layer", "password"}
+        if (
+            not isinstance(value, dict)
+            or not required.issubset(value)
+            or set(value) - required - {"type"}
+        ):
             raise ConfigError(
-                f"{uid}: expected pattern, layer, password, and type fields."
+                f"{uid}: expected pattern (a string), layer, password, and optional type."
             )
         try:
             result.append(
                 Pattern(
                     uid=uid,
-                    patterns=value["pattern"],
+                    pattern=value["pattern"],
                     layer=value["layer"],
                     passwords=value["password"],
-                    type=value["type"],
+                    type=value.get("type"),
                 )
             )
         except ValidationError as exc:

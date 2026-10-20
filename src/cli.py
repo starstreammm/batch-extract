@@ -85,27 +85,24 @@ def parser() -> argparse.ArgumentParser:
 
 def add_pattern(patterns: list[Pattern], console: Console) -> Pattern:
     console.print(
-        "Step 1/4: Enter filename regexes, or s/regex/replacement/. Blank finishes the list."
+        "Step 1/4: Enter one filename regex, or s/regex/replacement/."
     )
-    rules = []
     while True:
         value = Prompt.ask("Pattern", console=console, default="")
         if not value:
-            if rules:
-                break
-            console.print("Enter at least one pattern.")
+            console.print("Enter a nonempty pattern.")
             continue
         try:
             parse_rule(value)
         except (ValueError, re.error) as exc:
             console.print(Text(f"Invalid pattern: {exc}", style="red"))
             continue
-        rules.append(value)
+        break
     console.print(
-        "Step 2/4: Choose the outer archive type; missing suffixes are restored on temporary copies."
+        "Step 2/4: Optionally choose a type. Its matching suffix is removed before regex matching; auto matches the full filename."
     )
     kind = Prompt.ask(
-        "Type", choices=["7z", "rar", "zip"], default="7z", console=console
+        "Type", choices=["auto", "7z", "rar", "zip"], default="auto", console=console
     )
     console.print("Step 3/4: Choose how many nested archive layers to extract.")
     while (layers := IntPrompt.ask("Layers", default=1, console=console)) < 1:
@@ -127,7 +124,8 @@ def add_pattern(patterns: list[Pattern], console: Console) -> Pattern:
                 console=console,
             )
         )
-    return Pattern(new_uid(patterns), tuple(rules), layers, tuple(passwords), kind)
+    return Pattern(new_uid(patterns), value, layers, tuple(passwords),
+                   None if kind == "auto" else kind)
 
 
 def password_text(pattern: Pattern) -> str:
@@ -135,14 +133,14 @@ def password_text(pattern: Pattern) -> str:
 
 
 def list_patterns(patterns: list[Pattern], console: Console) -> None:
-    table = Table("UID", "Patterns", "Layers", "Passwords by layer", "Type")
+    table = Table("UID", "Pattern", "Layers", "Passwords by layer", "Type")
     for pattern in patterns:
         table.add_row(
             Text(pattern.uid),
-            Text("\n".join(pattern.patterns)),
+            Text(pattern.pattern),
             str(pattern.layer),
             Text(password_text(pattern)),
-            pattern.type,
+            pattern.type or "auto",
         )
     console.print(table)
     if not patterns:
@@ -323,13 +321,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         patterns = load_patterns(args.config)
         for pattern in patterns:
-            for rule in pattern.patterns:
-                try:
-                    parse_rule(rule)
-                except (ValueError, re.error) as exc:
-                    raise ConfigError(
-                        f"{pattern.uid}: invalid pattern {rule!r}: {exc}"
-                    ) from exc
+            try:
+                parse_rule(pattern.pattern)
+            except (ValueError, re.error) as exc:
+                raise ConfigError(
+                    f"{pattern.uid}: invalid pattern {pattern.pattern!r}: {exc}"
+                ) from exc
         if args.list:
             list_patterns(patterns, console)
         elif args.delete:

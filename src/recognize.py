@@ -49,7 +49,8 @@ def walk_files(
     return result
 
 
-def describe(path: Path, hint: str | None = None) -> Part | None:
+def describe_name(path: Path, hint: str | None = None) -> Part | None:
+    """Parse archive/volume naming independently of regex matching."""
     name = path.name
     if match := re.fullmatch(r"(.+?)\.part(\d+)(?:\.rar)?", name, re.I):
         return Part(
@@ -72,6 +73,12 @@ def describe(path: Path, hint: str | None = None) -> Part | None:
         return Part(path, match[1], kind, "plain", 0, f".{kind}")
     if hint:
         return Part(path, name, hint, "plain", 0, f".{hint}")
+    return None
+
+
+def describe(path: Path, hint: str | None = None) -> Part | None:
+    if part := describe_name(path, hint):
+        return part
     # Signature detection also permits extensionless archives between layers.
     with path.open("rb") as stream:
         header = stream.read(8)
@@ -88,10 +95,12 @@ def describe(path: Path, hint: str | None = None) -> Part | None:
         ),
         None,
     )
-    return Part(path, name, kind, "plain", 0, f".{kind}") if kind else None
+    return Part(path, path.name, kind, "plain", 0, f".{kind}") if kind else None
 
 
-def groups(files: list[Path], hint: str | None = None) -> list[Archive]:
+def groups(
+    files: list[Path], hint: str | None = None, *, include_unknown: bool = False
+) -> list[Archive]:
     inferred: dict[tuple[Path, str], str] = {}
     if hint is None:
         # Bare numeric volumes inside another archive have no configured type.
@@ -108,6 +117,10 @@ def groups(files: list[Path], hint: str | None = None) -> list[Archive]:
         )
         if (part := describe(path, local_hint)) is not None:
             parts.append(part)
+        elif include_unknown:
+            # Matching is allowed without a type or recognizable signature.
+            # 7-Zip will determine whether the selected file is an archive.
+            parts.append(Part(path, path.name, "", "plain", 0, ""))
     legacy = {(p.path.parent, p.base, p.kind) for p in parts if p.scheme == "legacy"}
     collected: dict[tuple, list[Part]] = {}
     for part in parts:
@@ -130,6 +143,14 @@ def groups(files: list[Path], hint: str | None = None) -> list[Archive]:
     return sorted(result, key=lambda a: str(a.primary))
 
 
+def match_name(filename: str, kind: str | None) -> tuple[str, str]:
+    """Strip only the configured suffix when it actually ends the filename."""
+    suffix = f".{kind}" if kind else ""
+    if suffix and filename.lower().endswith(suffix):
+        return filename[:-len(suffix)], filename[-len(suffix):]
+    return filename, ""
+
+
 def recognize(
     files: list[Path], patterns: list[Pattern]
 ) -> tuple[list[Archive], list[str]]:
@@ -137,17 +158,35 @@ def recognize(
     errors = []
     conflicted: set[Path] = set()
     for pattern in patterns:
-        rules = [parse_rule(value) for value in pattern.patterns]
-        for archive in groups(files, pattern.type):
-            if archive.kind != pattern.type:
+        rule = parse_rule(pattern.pattern)
+        for archive in groups(files, pattern.type, include_unknown=True):
+            renamed_bases = set()
+            staged_parts = archive.parts
+            staged_kind = archive.kind
+            for part in archive.parts:
+                subject, suffix = match_name(part.path.name, pattern.type)
+                renamed = rule.apply(subject)
+                if renamed is None:
+                    continue
+                # Reattach only what matching stripped, then normalize the
+                # archive/volume name for staging. Never append a second .zip.
+                full_name = renamed + suffix
+                renamed_part = describe_name(
+                    part.path.with_name(full_name), archive.kind or None
+                )
+                renamed_bases.add(renamed_part.base if renamed_part else full_name)
+                if len(archive.parts) == 1 and part.scheme == "plain" and renamed_part:
+                    staged_parts = (replace(
+                        part, base=renamed_part.base,
+                        kind=renamed_part.kind, suffix=renamed_part.suffix,
+                    ),)
+                    staged_kind = renamed_part.kind
+            if not renamed_bases:
                 continue
-            renamed = None
-            for rule in rules:
-                renamed = rule.apply(archive.name)
-                if renamed is not None:
-                    break
-            if renamed is None:
-                continue
+            error = archive.error
+            if len(renamed_bases) > 1:
+                error = "Replacement produces inconsistent basenames across volumes."
+            renamed = sorted(renamed_bases)[0]
             key = tuple(p.path for p in archive.parts)
             overlap = next(
                 (other for old, other in selected.items() if set(old) & set(key)), None
@@ -159,7 +198,10 @@ def recognize(
                 conflicted.update(key)
                 conflicted.update(p.path for p in overlap.parts)
             else:
-                selected[key] = replace(archive, name=renamed, pattern=pattern)
+                selected[key] = replace(
+                    archive, parts=staged_parts, name=renamed, kind=staged_kind,
+                    pattern=pattern, error=error,
+                )
     return [
         a for key, a in selected.items() if not conflicted.intersection(key)
     ], errors

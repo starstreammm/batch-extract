@@ -43,11 +43,11 @@ class CoreTests(unittest.TestCase):
 
     def test_config_roundtrip_password_reuse(self):
         path = self.root / "config.yaml"
-        pattern = Pattern("ab12", (r"s/^x(.*)$/\1/",), 3, ("123", "last"), "7z")
+        pattern = Pattern("ab12", r"s/^x(.*)$/\1/", 3, ("123", "last"), "7z")
         save_patterns(path, [pattern])
         self.assertEqual(load_patterns(path), [pattern])
         self.assertEqual(pattern.password(2), "last")
-        self.assertEqual(Pattern("aa", ("x",), 1, (), "zip").password(0), "")
+        self.assertEqual(Pattern("aa", "x", 1, (), "zip").password(0), "")
 
     def test_bad_config(self):
         path = self.root / "config.yaml"
@@ -55,18 +55,20 @@ class CoreTests(unittest.TestCase):
             "[]",
             "a: {}",
             "a: 1\na: 2",
-            "a: {pattern: [x], layer: true, password: [], type: zip}",
-            "a: {pattern: [x], layer: 1, password: [123], type: zip}",
-            'a: {pattern: [x], layer: "1", password: [], type: zip}',
-            "a: {pattern: [x], layer: 0, password: [], type: zip}",
+            "a: {pattern: x, layer: true, password: [], type: zip}",
+            "a: {pattern: x, layer: 1, password: [123], type: zip}",
+            'a: {pattern: x, layer: "1", password: [], type: zip}',
+            "a: {pattern: x, layer: 0, password: [], type: zip}",
             "a: {pattern: [], layer: 1, password: [], type: zip}",
             "a: {pattern: [123], layer: 1, password: [], type: zip}",
-            "a: {pattern: x, layer: 1, password: [], type: zip}",
-            "a: {pattern: [x], layer: 1, password: secret, type: zip}",
-            "a: {pattern: [x], layer: 1, password: [], type: tar}",
-            "a: {pattern: [x], layer: 1, password: [], type: zip, extra: 1}",
-            '"bad uid": {pattern: [x], layer: 1, password: [], type: zip}',
-            'a: {pattern: [x], layer: 1, password: ["bad\\0password"], type: zip}',
+            "a: {pattern: [x], layer: 1, password: [], type: zip}",
+            "a: {pattern: 123, layer: 1, password: [], type: zip}",
+            "a: {pattern: '', layer: 1, password: [], type: zip}",
+            "a: {pattern: x, layer: 1, password: secret, type: zip}",
+            "a: {pattern: x, layer: 1, password: [], type: tar}",
+            "a: {pattern: x, layer: 1, password: [], type: zip, extra: 1}",
+            '"bad uid": {pattern: x, layer: 1, password: [], type: zip}',
+            'a: {pattern: x, layer: 1, password: ["bad\\0password"], type: zip}',
         ):
             path.write_text(content)
             with self.subTest(content=content), self.assertRaises(ConfigError):
@@ -75,11 +77,70 @@ class CoreTests(unittest.TestCase):
     def test_validation_error_does_not_echo_password(self):
         path = self.root / "config.yaml"
         path.write_text(
-            'a: {pattern: [x], layer: 1, password: "private-secret", type: zip}'
+            'a: {pattern: x, layer: 1, password: "private-secret", type: zip}'
         )
         with self.assertRaises(ConfigError) as caught:
             load_patterns(path)
         self.assertNotIn("private-secret", str(caught.exception))
+
+    def test_config_optional_type_roundtrip(self):
+        path = self.root / "config.yaml"
+        for suffix in ("", ", type: null"):
+            path.write_text("a: {pattern: 'sample.zip', layer: 1, password: []" + suffix + "}")
+            patterns = load_patterns(path)
+            self.assertIsNone(patterns[0].type)
+            self.assertEqual(patterns[0].pattern, "sample.zip")
+            save_patterns(path, patterns)
+            self.assertNotIn("type:", path.read_text())
+            self.assertEqual(load_patterns(path), patterns)
+
+    def test_matching_suffix_depends_on_optional_type(self):
+        cases = [
+            ("sample.7z", "7z", r"^sample$", True),
+            ("sample.7z", "7z", r"^sample\.7z$", False),
+            ("sample.7z", None, r"^sample\.7z$", True),
+            ("sample.7z", None, r"^sample$", False),
+            ("sample.zip", "7z", r"^sample\.zip$", True),
+            ("sample.zip", "7z", r"^sample$", False),
+            ("sample.ZIP", "zip", r"^sample$", True),
+            ("sample", "7z", r"^sample$", True),
+            ("sample", None, r"^sample$", True),
+            ("sample.7z.001", "7z", r"^sample\.7z\.001$", True),
+            ("sample.7z.001", "7z", r"^sample$", False),
+            ("sample.part01.rar", "rar", r"^sample\.part01$", True),
+        ]
+        for filename, kind, regex, expected in cases:
+            with self.subTest(filename=filename, kind=kind, regex=regex):
+                result, errors = recognize(self.files(filename), [Pattern("a", regex, 1, (), kind)])
+                self.assertEqual(bool(result), expected)
+                self.assertFalse(errors)
+
+    def test_multipart_match_on_any_volume(self):
+        paths = self.files("sample.7z.001", "sample.7z.002")
+        result, errors = recognize(paths, [Pattern("a", r"^sample\.7z\.002$", 1, ())])
+        self.assertFalse(errors)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(len(result[0].parts), 2)
+        self.assertEqual(result[0].name, "sample")
+
+    def test_full_filename_replacement_without_type(self):
+        result, errors = recognize(
+            self.files("download_sample.zip"),
+            [Pattern("a", r"s/^download_(.*)\.zip$/\1.zip/", 1, ())],
+        )
+        self.assertFalse(errors)
+        self.assertEqual(result[0].name, "sample")
+        self.assertEqual(result[0].parts[0].suffix, ".zip")
+
+    def test_full_filename_replacement_can_change_suffix(self):
+        result, errors = recognize(
+            self.files("sample.zip"),
+            [Pattern("a", r"s/^sample\.zip$/renamed.7z/", 1, ())],
+        )
+        self.assertFalse(errors)
+        self.assertEqual(result[0].name, "renamed")
+        self.assertEqual(result[0].parts[0].suffix, ".7z")
+        self.assertEqual(result[0].primary.name, "sample.zip")
 
     def test_volume_formats(self):
         cases = [
@@ -110,19 +171,19 @@ class CoreTests(unittest.TestCase):
 
     def test_recognition_rename_and_conflict(self):
         files = self.files("download_name.zip", "unrelated.txt")
-        pattern = Pattern("abc", (r"s/^download_(.*)$/\1/",), 1, (), "zip")
+        pattern = Pattern("abc", r"s/^download_(.*)$/\1/", 1, (), "zip")
         result, errors = recognize(files, [pattern])
         self.assertFalse(errors)
         self.assertEqual(result[0].name, "name")
         result, errors = recognize(
-            files, [pattern, Pattern("def", (".*",), 1, (), "zip")]
+            files, [pattern, Pattern("def", ".*", 1, (), "zip")]
         )
         self.assertTrue(errors)
         self.assertNotIn(files[0], [a.primary for a in result])
 
     def test_extensionless_and_suffix_stripping(self):
         files = self.files("archive", "other.7z")
-        result, errors = recognize(files, [Pattern("a", ("^archive$",), 1, (), "zip")])
+        result, errors = recognize(files, [Pattern("a", "^archive$", 1, (), "zip")])
         self.assertEqual(result[0].parts[0].suffix, ".zip")
         self.assertFalse(errors)
 
