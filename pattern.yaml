@@ -1,0 +1,8 @@
+# Run python main.py --add to create your first pattern.
+# Example (remove the final {} if uncommenting):
+# "a1b2c3d4":
+#   pattern: ['^example_\d+$', 's/^download_(.*)$/\1/']
+#   layer: 2
+#   password: ['outer-password', 'inner-password']
+#   type: '7z'
+{}
