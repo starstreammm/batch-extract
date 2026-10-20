@@ -32,7 +32,7 @@ multilayer runs but is left untouched by single-layer runs.
   pattern: 's/^download_(.*)$/\1/'
   layer: 2
   password: ['outer', 'inner']
-  type: '7z'  # Optional: 7z | rar | zip; may be omitted or null.
+  type: '7z'  # Required: 7z | rar | zip.
 ```
 
 User clarification: patterns must be regular expressions and may include a
@@ -41,16 +41,23 @@ for normal regexes and `s/regex/replacement/` (optional `i`) for substitutions.
 Support sed-style escaped captures/quantifiers as a fallback for otherwise-invalid
 replacement backreferences, e.g. `s/\([a-zA-Z]\+\)\.7z\.exe$/\1.7z.001/`.
 Use single backslashes in interactive input and YAML single-quoted strings.
-`pattern` must be a single string, never a list. For each file and rule, strip
-only the configured `.<type>` suffix if the filename ends with it (case-insensitive).
-Otherwise match the whole filename, including any suffix. With `type` omitted,
-always match the whole filename. A mismatched type never excludes a file.
-Never match directory paths. Volume grouping is separate: test each volume name
-and extract its complete group once if any volume matches. Thus `foo.7z.001`
-is matched in full even with `type: 7z`; `foo.part01.rar` becomes `foo.part01`
-with `type: rar`. Reattach any stripped suffix after substitution. Group planned
+`pattern` must be a single string, never a list; `type` is required, never null.
+First check each filename against the configured type's complete archive/volume
+naming style, case-insensitively. If it matches, apply the regex to the basename:
+`1111.7z.001` with type `7z` becomes `1111`; `foo.part01.rar` with type `rar`
+becomes `foo`. Otherwise match the whole name: `11111.8z` remains `11111.8z`
+with type `7z`. A mismatched type never excludes a file. Never match directories.
+Test each volume name and extract its complete group once if any volume matches.
+Reattach any stripped archive/volume suffix after substitution. Group planned
 names before extraction so a renamed `.7z.exe` -> `.7z.001` joins existing siblings.
-Use format detection when no type is supplied. Regexes do not select layers.
+For every intermediate layer, normalize filenames in place inside `OUTPUT/temp`
+to the configured type before extracting. Recognize loose `partNN` and `.NNN.`
+markers even when extensions are missing/misleading. Normalize multipart 7z to
+`base.7z.001`, ZIP to `base.zip.001`, and RAR to `base.part01.rar`. Preserve valid
+native legacy styles. Identify ordinary inner archives by names/signatures, or
+attempt a lone opaque file; retain unrelated sidecars. Reject missing/duplicate
+volumes and collisions. This renames files, not their actual formats. Regexes
+apply only to the outer layer.
 
 Required CLI:
 

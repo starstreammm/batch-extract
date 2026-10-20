@@ -44,7 +44,7 @@ class Pattern:
     pattern: Annotated[str, Field(min_length=1)]
     layer: Annotated[int, Field(ge=1)]
     passwords: tuple[str, ...]
-    type: Literal["7z", "rar", "zip"] | None = None
+    type: Literal["7z", "rar", "zip"]
 
     @field_validator("passwords", mode="before")
     @classmethod
@@ -71,9 +71,8 @@ class Pattern:
             "pattern": self.pattern,
             "layer": self.layer,
             "password": list(self.passwords),
+            "type": self.type,
         }
-        if self.type is not None:
-            record["type"] = self.type
         return record
 
 
@@ -90,14 +89,14 @@ def load_patterns(path: Path) -> list[Pattern]:
         raise ConfigError("Configuration must be a mapping of UID to pattern.")
     result = []
     for uid, value in data.items():
-        required = {"pattern", "layer", "password"}
+        required = {"pattern", "layer", "password", "type"}
         if (
             not isinstance(value, dict)
             or not required.issubset(value)
-            or set(value) - required - {"type"}
+            or set(value) - required
         ):
             raise ConfigError(
-                f"{uid}: expected pattern (a string), layer, password, and optional type."
+                f"{uid}: expected pattern (a string), layer, password, and required type."
             )
         try:
             result.append(
@@ -106,7 +105,7 @@ def load_patterns(path: Path) -> list[Pattern]:
                     pattern=value["pattern"],
                     layer=value["layer"],
                     passwords=value["password"],
-                    type=value.get("type"),
+                    type=value["type"],
                 )
             )
         except ValidationError as exc:

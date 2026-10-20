@@ -55,8 +55,8 @@ uv run --locked python main.py --delete a1b2c3d4
 uv run --locked python main.py --config ./private-patterns.yaml --add
 ```
 
-`--add` asks for one regex or replacement string, an optional archive type, layer
-count, and passwords. Choose `auto` (the default) to omit `type`.
+`--add` asks for one regex or replacement string, the required archive type
+(`7z`, `rar`, or `zip`), layer count, and passwords.
 It generates an eight-character hex UID.
 Passwords are entered without terminal echo; later layers can reuse the last one.
 
@@ -87,10 +87,10 @@ archive does not stop unrelated archive groups.
   type: '7z'
 
 "e5f6a7b8":
-  pattern: '(?i)^photos(?:_\d+)?\.zip$'
+  pattern: '(?i)^photos(?:_\d+)?$'
   layer: 1
   password: []
-  # type is optional; this rule matches the full filename.
+  type: 'zip'
 ```
 
 - `pattern` is one nonempty string using **Python regular expressions**, optionally
@@ -98,12 +98,13 @@ archive does not stop unrelated archive groups.
   separate UID entries for alternatives.
   Matching uses `re.search`; add `^` and `$` to match the whole name. Matching is
   case-sensitive unless you use `(?i)` or a substitution's `i` flag.
-- Only the filename is considered, never its directory. `type` is optional
-  (`7z`, `rar`, or `zip`; omitted or `null` means automatic detection).
-  When a filename ends with the configured `.<type>` suffix, that suffix alone
-  is removed before matching. Suffix comparison is case-insensitive.
-  Otherwise the **whole filename** is matched, including any suffix.
-  With no `type`, the whole filename is always matched.
+- Only the filename is considered, never its directory. `type` is **required**
+  and must be `7z`, `rar`, or `zip`; omitted or `null` values are rejected.
+  First check whether the filename follows that type's naming style. If it does,
+  strip the complete archive/volume suffix and match the basename.
+  Naming-style checks are case-insensitive. Otherwise match the **whole filename**.
+  For example, with `type: 7z`, `1111.7z.001` matches as `1111`,
+  while `11111.8z` matches as `11111.8z`.
 - `type` is a naming hint, not a filter: a `type: 7z` rule can match a ZIP file
   using a regex that includes `.zip`. Actual extraction uses 7-Zip format detection.
   Extensionless files are passed directly to 7-Zip; use a replacement rule if a
@@ -111,10 +112,12 @@ archive does not stop unrelated archive groups.
   A matched file with no recognizable format is still attempted by 7-Zip;
   failed extraction retains the original.
 - Volume grouping is independent of matching. Each volume filename is considered;
-  a match on any volume selects the entire group once. For example, with
-  `type: 7z`, `movie_12.7z.001` is matched in full (it does not end in `.7z`);
-  use `^movie_12\.7z\.\d{3}$`. With `type: rar`, `movie.part01.rar` is matched
-  as `movie.part01`. Replacements must yield a consistent basename across volumes.
+  a match on any volume selects the entire group once. `movie.7z.001`,
+  `movie.part01.rar`, and `movie.zip.001` all match as `movie` when their
+  configured type is `7z`, `rar`, and `zip`, respectively.
+  Legacy RAR `.r00` and ZIP `.z01` suffixes are also recognized for their types.
+  A bare `movie.001` does not follow the complete 7z naming style, so it matches
+  in full. Replacements must yield a consistent basename across volumes.
 - Renaming uses `s/REGEX/REPLACEMENT/`, with optional trailing `i` for case-insensitive
   matching. Delimiters `/`, `|`, `#`, and `~` are supported. Backreferences such as
   `\1` and `\g<name>` work. All occurrences are replaced, as with `re.sub`.
@@ -134,13 +137,16 @@ archive does not stop unrelated archive groups.
   are restored. On success, `-s` retains the files under their renamed names;
   without `-s`, successful inputs are deleted. Existing rename destinations are
   never intentionally overwritten; collisions fail the group.
-  A stripped suffix is reattached after substitution. Without `type`, write
-  substitutions against the full filename, e.g. `s/^download_(.+)\.zip$/\1.zip/`.
+  A stripped archive/volume suffix is reattached after substitution. For names
+  that do not follow the configured style, write substitutions against the full
+  filename, e.g. `s/^download_(.+)\.zip$/\1.zip/` with `type: 7z`.
   Planned names are grouped before files are changed: renaming `demo.7z.exe` to
   `demo.7z.001` joins it with existing `demo.7z.002`, `.003`, and later volumes.
 - `layer` is a positive integer: `1` extracts the outer archive, `2` also extracts
-  archives inside it, and so on. Inner formats are detected independently and may
-  differ from `type`. Regexes apply only to the outer archive.
+  archives inside it, and so on. Before extracting each inner layer, its filenames
+  are normalized to the configured type's naming rules as described below.
+  Renaming does not convert archive contents; 7-Zip still detects the actual format.
+  Regexes apply only to the outer archive.
 - `password` contains strings in layer order. If shorter than `layer`, the final
   password is reused. `[]` or `['']` means no password; use an empty string for an
   unencrypted layer followed by an encrypted one. Extra passwords are unused.
@@ -158,9 +164,38 @@ Examples of the text passed to the regex:
 | --- | --- | --- |
 | `report.7z` | `7z` | `report` |
 | `report.zip` | `7z` | `report.zip` |
-| `report.7z` | omitted | `report.7z` |
+| `11111.8z` | `7z` | `11111.8z` |
 | `report` | `7z` | `report` |
-| `report.7z.001` | `7z` | `report.7z.001` |
+| `report.7z.001` | `7z` | `report` |
+| `report.part01.rar` | `rar` | `report` |
+| `report.zip.001` | `zip` | `report` |
+| `report.001` | `7z` | `report.001` |
+
+## Intermediate archive names
+
+For `layer > 1`, intermediate files may have missing or misleading extensions.
+Before the next extraction, normalize them **in place inside `OUTPUT/temp`**:
+
+| Intermediate input | Configured `type` | Normalized input |
+| --- | --- | --- |
+| `inner.payload` containing an archive | `7z` | `inner.7z` |
+| `inner.part01.bin`, `inner.part02.bin` | `7z` | `inner.7z.001`, `inner.7z.002` |
+| `inner.001.payload`, `inner.002.payload` | `zip` | `inner.zip.001`, `inner.zip.002` |
+| `inner.part01`, `inner.part02` | `rar` | `inner.part01.rar`, `inner.part02.rar` |
+| `inner.7z.001.exe`, `inner.7z.002.exe` | `7z` | `inner.7z.001`, `inner.7z.002` |
+
+Recognized names already following the type's style are retained, including
+native `.rar`/`.r00` and `.zip`/`.z01` groups. Loose `partNN` markers (with a
+separator or at the start) and `.NNN` numeric markers, optionally followed by
+another extension, identify intermediate volume groups. Numbers must start at
+one and be consecutive, except for the native legacy formats. Duplicate volume
+numbers, missing parts, and rename collisions fail the outer archive safely.
+
+Other intermediate archive candidates are identified by archive names or file
+signatures. A lone unrecognized file is attempted as the next layer. Ordinary
+sidecar files are retained; do not use volume-style names for sidecars. No input
+copies are made, and the original outer filenames are restored if a later layer
+fails. A file's name alone cannot guarantee that its contents are a valid archive.
 
 ## Three stages
 

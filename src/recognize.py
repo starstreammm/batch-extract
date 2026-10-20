@@ -149,12 +149,92 @@ def collect_parts(parts: list[Part]) -> list[Archive]:
     return sorted(result, key=lambda a: str(a.primary))
 
 
-def match_name(filename: str, kind: str | None) -> tuple[str, str]:
-    """Strip only the configured suffix when it actually ends the filename."""
-    suffix = f".{kind}" if kind else ""
-    if suffix and filename.lower().endswith(suffix):
-        return filename[:-len(suffix)], filename[-len(suffix):]
+def match_name(filename: str, kind: str) -> tuple[str, str]:
+    """Strip a complete archive/volume suffix only when it fits the required type."""
+    styles = {
+        "7z": r"(.+?)(\.7z(?:\.\d{3,})?)",
+        "zip": r"(.+?)(\.zip(?:\.\d{3,})?|\.z\d{2,})",
+        "rar": r"(.+?)(\.part\d+\.rar|\.rar(?:\.\d{3,})?|\.r\d{2,})",
+    }
+    match = re.fullmatch(styles[kind], filename, re.IGNORECASE)
+    if match:
+        return match[1], match[2]
     return filename, ""
+
+
+def clean_base(name: str) -> str:
+    """Remove a known archive suffix left ahead of a loose volume marker."""
+    return re.sub(r"\.(?:7z|rar|zip)$", "", name, flags=re.I) or "archive"
+
+
+def volume_suffix(kind: str, index: int) -> tuple[str, str]:
+    if kind == "rar":
+        return "part", f".part{index:02d}.rar"
+    return "numeric", f".{kind}.{index:03d}"
+
+
+def intermediate_groups(files: list[Path], kind: str) -> list[Archive]:
+    """Plan canonical names for inner archives, retaining unrelated sidecar files."""
+    candidates = []
+    for path in files:
+        canonical = describe_name(path)
+        if (
+            canonical is not None and canonical.kind == kind
+            and canonical.scheme != "plain" and match_name(path.name, kind)[1]
+        ):
+            candidates.append(canonical)
+            continue
+        # Loose markers may have arbitrary trailing extensions, or none.
+        part_marker = re.fullmatch(
+            r"(?:(.+?)[._ -])?part[._ -]?(\d+)(?:[._ -].*)?", path.name, re.I
+        )
+        numeric_marker = re.fullmatch(r"(.+?)\.(\d{3,})(?:\..*)?", path.name)
+        marker = part_marker or numeric_marker
+        if marker:
+            base = clean_base(marker[1] or "archive")
+            index = int(marker[2])
+            scheme, suffix = volume_suffix(kind, index)
+            candidates.append(Part(path, base, kind, scheme, index, suffix))
+        elif (part := describe(path)) is not None:
+            candidates.append(part)
+    # A lone opaque file is the only possible next layer (e.g. an SFX archive).
+    if not candidates and len(files) == 1:
+        candidates.append(Part(files[0], files[0].name, kind, "plain", 0, f".{kind}"))
+
+    planned = []
+    for archive in collect_parts(candidates):
+        parts = []
+        for part in archive.parts:
+            described = describe_name(part.path)
+            if (
+                described is not None and described.kind == kind
+                and described.scheme == part.scheme and match_name(part.path.name, kind)[1]
+            ):
+                parts.append(part)
+                continue
+            if part.scheme == "plain":
+                if match_name(part.path.name, kind)[1]:
+                    base = part.base
+                else:
+                    base = clean_base(
+                        Path(part.base).stem if part.base == part.path.name else part.base
+                    )
+                suffix = f".{kind}"
+                scheme, index = "plain", 0
+            elif part.scheme == "legacy" and part.kind == kind:
+                # Keep native .rar/.r00 and .zip/.z01 conventions.
+                base, suffix, scheme, index = part.base, part.suffix, part.scheme, part.index
+            else:
+                base = clean_base(part.base)
+                index = part.index + 1 if part.scheme == "legacy" else part.index
+                scheme, suffix = volume_suffix(kind, index)
+            target = base + suffix
+            parts.append(replace(
+                part, base=base, kind=kind, scheme=scheme, index=index, suffix=suffix,
+                target_name=target if target != part.path.name else None,
+            ))
+        planned.extend(parts)
+    return collect_parts(planned)
 
 
 def recognize(

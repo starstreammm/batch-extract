@@ -6,7 +6,7 @@ from pathlib import Path
 from src.config import ConfigError, Pattern, load_patterns, save_patterns
 from src.extract import ExtractionError, check_listing_line, publish
 from src.matching import parse_rule
-from src.recognize import groups, recognize, walk_files
+from src.recognize import groups, intermediate_groups, recognize, walk_files
 
 
 class CoreTests(unittest.TestCase):
@@ -93,31 +93,30 @@ class CoreTests(unittest.TestCase):
             load_patterns(path)
         self.assertNotIn("private-secret", str(caught.exception))
 
-    def test_config_optional_type_roundtrip(self):
+    def test_config_requires_type(self):
         path = self.root / "config.yaml"
         for suffix in ("", ", type: null"):
             path.write_text("a: {pattern: 'sample.zip', layer: 1, password: []" + suffix + "}")
-            patterns = load_patterns(path)
-            self.assertIsNone(patterns[0].type)
-            self.assertEqual(patterns[0].pattern, "sample.zip")
-            save_patterns(path, patterns)
-            self.assertNotIn("type:", path.read_text())
-            self.assertEqual(load_patterns(path), patterns)
+            with self.assertRaises(ConfigError):
+                load_patterns(path)
 
-    def test_matching_suffix_depends_on_optional_type(self):
+    def test_matching_uses_required_type_naming_style(self):
         cases = [
             ("sample.7z", "7z", r"^sample$", True),
             ("sample.7z", "7z", r"^sample\.7z$", False),
-            ("sample.7z", None, r"^sample\.7z$", True),
-            ("sample.7z", None, r"^sample$", False),
             ("sample.zip", "7z", r"^sample\.zip$", True),
             ("sample.zip", "7z", r"^sample$", False),
             ("sample.ZIP", "zip", r"^sample$", True),
             ("sample", "7z", r"^sample$", True),
-            ("sample", None, r"^sample$", True),
-            ("sample.7z.001", "7z", r"^sample\.7z\.001$", True),
-            ("sample.7z.001", "7z", r"^sample$", False),
-            ("sample.part01.rar", "rar", r"^sample\.part01$", True),
+            ("sample.7z.001", "7z", r"^sample\.7z\.001$", False),
+            ("sample.7z.001", "7z", r"^sample$", True),
+            ("sample.part01.rar", "rar", r"^sample$", True),
+            ("sample.part01.rar", "7z", r"^sample\.part01\.rar$", True),
+            ("sample.zip.001", "zip", r"^sample$", True),
+            ("sample.z01", "zip", r"^sample$", True),
+            ("sample.r00", "rar", r"^sample$", True),
+            ("11111.8z", "7z", r"^11111\.8z$", True),
+            ("1111.7z.001", "7z", r"^1111$", True),
         ]
         for filename, kind, regex, expected in cases:
             with self.subTest(filename=filename, kind=kind, regex=regex):
@@ -127,16 +126,16 @@ class CoreTests(unittest.TestCase):
 
     def test_multipart_match_on_any_volume(self):
         paths = self.files("sample.7z.001", "sample.7z.002")
-        result, errors = recognize(paths, [Pattern("a", r"^sample\.7z\.002$", 1, ())])
+        result, errors = recognize(paths, [Pattern("a", r"^sample$", 1, (), "7z")])
         self.assertFalse(errors)
         self.assertEqual(len(result), 1)
         self.assertEqual(len(result[0].parts), 2)
         self.assertEqual(result[0].name, "sample")
 
-    def test_full_filename_replacement_without_type(self):
+    def test_full_filename_replacement_with_mismatched_type(self):
         result, errors = recognize(
             self.files("download_sample.zip"),
-            [Pattern("a", r"s/^download_(.*)\.zip$/\1.zip/", 1, ())],
+            [Pattern("a", r"s/^download_(.*)\.zip$/\1.zip/", 1, (), "7z")],
         )
         self.assertFalse(errors)
         self.assertEqual(result[0].name, "sample")
@@ -145,12 +144,47 @@ class CoreTests(unittest.TestCase):
     def test_full_filename_replacement_can_change_suffix(self):
         result, errors = recognize(
             self.files("sample.zip"),
-            [Pattern("a", r"s/^sample\.zip$/renamed.7z/", 1, ())],
+            [Pattern("a", r"s/^sample\.zip$/renamed.7z/", 1, (), "7z")],
         )
         self.assertFalse(errors)
         self.assertEqual(result[0].name, "renamed")
         self.assertEqual(result[0].parts[0].suffix, ".7z")
         self.assertEqual(result[0].primary.name, "sample.zip")
+
+    def test_intermediate_volume_name_normalization(self):
+        cases = [
+            ("7z", ["movie.part01.bin", "movie.part02.bin"],
+             ["movie.7z.001", "movie.7z.002"]),
+            ("7z", ["movie.001.download", "movie.002.download"],
+             ["movie.7z.001", "movie.7z.002"]),
+            ("zip", ["movie.part01", "movie.part02"],
+             ["movie.zip.001", "movie.zip.002"]),
+            ("rar", ["movie.001.payload", "movie.002.payload"],
+             ["movie.part01.rar", "movie.part02.rar"]),
+            ("7z", ["movie.7z.001.exe", "movie.7z.002.exe"],
+             ["movie.7z.001", "movie.7z.002"]),
+            ("7z", ["movie.part01.7z", "movie.part02.7z"],
+             ["movie.7z.001", "movie.7z.002"]),
+            ("rar", ["movie.rar", "movie.r00"], ["movie.rar", "movie.r00"]),
+            ("zip", ["movie.zip", "movie.z01"], ["movie.zip", "movie.z01"]),
+        ]
+        for kind, names, expected in cases:
+            with self.subTest(kind=kind, names=names):
+                result = intermediate_groups(self.files(*names), kind)
+                self.assertEqual(len(result), 1)
+                self.assertFalse(result[0].error)
+                self.assertEqual(
+                    [p.target_name or p.path.name for p in result[0].parts], expected
+                )
+                self.assertTrue(all(p.path.exists() for p in result[0].parts))
+
+    def test_intermediate_missing_and_duplicate_volumes(self):
+        for names in (
+            ["movie.part01.bin", "movie.part03.bin"],
+            ["movie.001.a", "movie.001.b"],
+        ):
+            with self.subTest(names=names):
+                self.assertTrue(intermediate_groups(self.files(*names), "7z")[0].error)
 
     def test_volume_formats(self):
         cases = [

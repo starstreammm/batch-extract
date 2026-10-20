@@ -4,5 +4,5 @@
 #   pattern: 's/^download_(.*)$/\1/'
 #   layer: 2
 #   password: ['outer-password', 'inner-password']
-#   type: '7z'  # Optional. If omitted, match the whole filename.
+#   type: '7z'  # Required: 7z, rar, or zip.
 {}

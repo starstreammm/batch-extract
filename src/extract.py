@@ -3,14 +3,14 @@
 import asyncio
 from collections import deque
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import shutil
 import tempfile
 
-from .recognize import Archive, groups, walk_files
+from .recognize import Archive, intermediate_groups, walk_files
 
 
 class ExtractionError(RuntimeError):
@@ -273,26 +273,33 @@ class Extractor:
         if depth + 1 == layers:
             return payload
         files = walk_files(payload, True)
-        nested = groups(files)
+        kind = archive.pattern.type if archive.pattern else archive.kind
+        nested = intermediate_groups(files, kind)
         if not nested:
             raise ExtractionError(
                 f"Expected another archive at layer {depth + 2}, but found none."
             )
-        nested_files = {p.path for a in nested for p in a.parts}
-        # A single wrapped archive can be unwrapped without accumulating containers.
-        if len(nested) == 1 and set(files) == nested_files:
-            return await self.extract(
-                nested[0], layers, passwords, progress, depth + 1,
-                destination=destination,
-            )
-        # Multiple archives and sidecar files are retained in their original directories.
-        move_sidecars(payload, destination, nested_files)
-        for inner in nested:
-            parent = destination / inner.primary.parent.relative_to(payload)
-            inner_destination = reserve_directory(parent, inner.name)
-            result = await self.extract(
-                inner, layers, passwords, progress, depth + 1,
-                destination=inner_destination,
-            )
-            publish(result, parent, inner.name)
+        with ExitStack() as stack:
+            transactions = [stack.enter_context(SourceNames()) for _ in nested]
+            nested = [names.prepare(inner) for names, inner in zip(transactions, nested)]
+            nested_files = {p.path for a in nested for p in a.parts}
+            files = walk_files(payload, True)
+            # A single wrapped archive is unwrapped without accumulating containers.
+            if len(nested) == 1 and set(files) == nested_files:
+                await self.extract(
+                    nested[0], layers, passwords, progress, depth + 1,
+                    destination=destination,
+                )
+            else:
+                move_sidecars(payload, destination, nested_files)
+                for inner in nested:
+                    parent = destination / inner.primary.parent.relative_to(payload)
+                    inner_destination = reserve_directory(parent, inner.name)
+                    result = await self.extract(
+                        inner, layers, passwords, progress, depth + 1,
+                        destination=inner_destination,
+                    )
+                    publish(result, parent, inner.name)
+            for names in transactions:
+                names.committed = True
         return destination

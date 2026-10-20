@@ -102,10 +102,10 @@ def add_pattern(patterns: list[Pattern], console: Console) -> Pattern:
             continue
         break
     console.print(
-        "Step 2/4: Optionally choose a type. Its matching suffix is removed before regex matching; auto matches the full filename."
+        "Step 2/4: Choose the required type. Matching archive/volume suffixes are removed before applying the regex."
     )
     kind = Prompt.ask(
-        "Type", choices=["auto", "7z", "rar", "zip"], default="auto", console=console
+        "Type", choices=["7z", "rar", "zip"], console=console
     )
     console.print("Step 3/4: Choose how many nested archive layers to extract.")
     while (layers := IntPrompt.ask("Layers", default=1, console=console)) < 1:
@@ -127,8 +127,7 @@ def add_pattern(patterns: list[Pattern], console: Console) -> Pattern:
                 console=console,
             )
         )
-    return Pattern(new_uid(patterns), value, layers, tuple(passwords),
-                   None if kind == "auto" else kind)
+    return Pattern(new_uid(patterns), value, layers, tuple(passwords), kind)
 
 
 def password_text(pattern: Pattern) -> str:
@@ -143,7 +142,7 @@ def list_patterns(patterns: list[Pattern], console: Console) -> None:
             Text(pattern.pattern),
             str(pattern.layer),
             Text(password_text(pattern)),
-            pattern.type or "auto",
+            pattern.type,
         )
     console.print(table)
     if not patterns:

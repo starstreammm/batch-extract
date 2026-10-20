@@ -193,7 +193,7 @@ class IntegrationTests(unittest.TestCase):
                 raise OSError("cannot rename second volume")
             return original_rename(path, target)
 
-        pattern = Pattern("a", r"s/^download_(.*)$/\1/", 1, ())
+        pattern = Pattern("a", r"s/^download_(.*)$/\1/", 1, (), "7z")
         with patch.object(Path, "rename", fail_second):
             self.assertEqual(self.run_batch(pattern), 1)
         self.assertEqual(set(self.source.iterdir()), set(paths))
@@ -225,19 +225,19 @@ class IntegrationTests(unittest.TestCase):
         first = self.source / "sample.7z.exe"
         (self.source / "sample.7z.001").rename(first)
         inode = first.stat().st_ino
-        pattern = Pattern("a", r"s/\([a-zA-Z]\+\)\.7z\.exe$/\1.7z.001/", 1, ())
+        pattern = Pattern("a", r"s/\([a-zA-Z]\+\)\.7z\.exe$/\1.7z.001/", 1, (), "7z")
         self.assertEqual(self.run_batch(pattern, save=True), 0, self.log.getvalue())
         self.assertEqual((self.source / "sample.7z.001").stat().st_ino, inode)
         self.assertFalse(first.exists())
         self.assertEqual((self.output / "sample/data.bin").read_bytes(), data.read_bytes())
         self.assertFalse((self.output / "temp").exists())
         # A subsequent ordinary split-volume extraction deletes the entire group.
-        self.assertEqual(self.run_batch(Pattern("b", r"^sample\.7z\.\d+$", 1, ())), 0,
+        self.assertEqual(self.run_batch(Pattern("b", r"^sample$", 1, (), "7z")), 0,
                          self.log.getvalue())
         self.assertFalse(list(self.source.iterdir()))
 
-    def test_optional_or_mismatched_type_full_filename(self):
-        for kind in (None, "7z"):
+    def test_mismatched_type_full_filename(self):
+        for kind in ("rar", "7z"):
             with self.subTest(kind=kind):
                 archive = self.zip("download_sample.zip", {"file.txt": "hello"})
                 pattern = Pattern("a", r"s/^download_(.*)\.zip$/\1.zip/", 1, (), kind)
@@ -246,9 +246,9 @@ class IntegrationTests(unittest.TestCase):
                 self.assertEqual((self.output / "sample/file.txt").read_text(), "hello")
                 shutil.rmtree(self.output)
 
-    def test_extensionless_without_type(self):
+    def test_extensionless_with_required_type(self):
         self.zip("sample", {"file.txt": "hello"})
-        self.assertEqual(self.run_batch(Pattern("a", "^sample$", 1, ())), 0, self.log.getvalue())
+        self.assertEqual(self.run_batch(Pattern("a", "^sample$", 1, (), "7z")), 0, self.log.getvalue())
         self.assertEqual((self.output / "sample/file.txt").read_text(), "hello")
 
     def test_multiple_folders(self):
@@ -351,6 +351,107 @@ class IntegrationTests(unittest.TestCase):
             (self.output / "sample/data.bin").read_bytes(), data.read_bytes()
         )
 
+    def test_nested_malformed_volume_names_are_renamed_before_reading(self):
+        data = self.root / "data.bin"
+        data.write_bytes(bytes(range(256)) * 16)
+        asyncio.run(run_7z(
+            SEVEN_ZIP, ["a", "-mx=0", "-v1k", str(self.root / "inner.7z"), str(data)]
+        ))
+        volumes = sorted(self.root.glob("inner.7z.*"))
+        formats = [
+            "inner.part{index:02}.bin",
+            "inner.{index:03}.payload",
+            "inner.7z.{index:03}.exe",
+            "inner.part{index:02}.7z",
+        ]
+        for format_string in formats:
+            with self.subTest(format=format_string):
+                self.zip("sample.zip", {
+                    format_string.format(index=index): path.read_bytes()
+                    for index, path in enumerate(volumes, 1)
+                })
+                seen = []
+
+                async def inspect_names(executable, args, **kwargs):
+                    source = Path(args[-1])
+                    if source.is_relative_to(self.output.resolve() / "temp"):
+                        self.assertEqual(source.name, "inner.7z.001")
+                        self.assertEqual(
+                            {p.name for p in source.parent.iterdir()},
+                            {f"inner.7z.{i:03}" for i in range(1, len(volumes) + 1)},
+                        )
+                        seen.append(source)
+                    return await run_7z(executable, args, **kwargs)
+
+                with patch("src.extract.run_7z", side_effect=inspect_names):
+                    self.assertEqual(
+                        self.run_batch(Pattern("a", r"^sample\.zip$", 2, (), "7z")),
+                        0, self.log.getvalue(),
+                    )
+                self.assertTrue(seen)
+                self.assertEqual((self.output / "sample/data.bin").read_bytes(), data.read_bytes())
+                self.assertFalse((self.output / "temp").exists())
+                shutil.rmtree(self.output)
+
+    def test_normalizes_each_intermediate_layer(self):
+        def zip_bytes(name, content):
+            stream = io.BytesIO()
+            with zipfile.ZipFile(stream, "w") as archive:
+                archive.writestr(name, content)
+            return stream.getvalue()
+
+        inner = zip_bytes("file.txt", "three layers")
+        middle = zip_bytes("inner.hidden", inner)
+        self.zip("sample.zip", {"middle.payload": middle})
+        seen = []
+
+        async def inspect_names(executable, args, **kwargs):
+            source = Path(args[-1])
+            if source.is_relative_to(self.output.resolve() / "temp"):
+                seen.append(source.name)
+            return await run_7z(executable, args, **kwargs)
+
+        with patch("src.extract.run_7z", side_effect=inspect_names):
+            self.assertEqual(
+                self.run_batch(Pattern("a", "^sample$", 3, (), "zip")),
+                0, self.log.getvalue(),
+            )
+        self.assertEqual(set(seen), {"middle.zip", "inner.zip"})
+        self.assertEqual((self.output / "sample/file.txt").read_text(), "three layers")
+        self.assertFalse((self.output / "temp").exists())
+
+    def test_nested_missing_volume_restores_outer_name(self):
+        archive = self.zip("download_sample.zip", {
+            "inner.part01.bin": b"first", "inner.part03.bin": b"third",
+        })
+        original = archive.read_bytes()
+        pattern = Pattern("a", r"s/^download_(.*)$/\1/", 2, (), "7z")
+        self.assertEqual(self.run_batch(pattern), 1)
+        self.assertEqual(archive.read_bytes(), original)
+        self.assertFalse((self.source / "sample.zip").exists())
+        self.assertFalse(list(self.output.iterdir()))
+
+    def test_nested_normalization_retains_sidecars(self):
+        inner = self.zip("inner.zip", {"file.txt": "data"})
+        contents = inner.read_bytes()
+        inner.unlink()
+        self.zip("sample.zip", {"inner.payload": contents, "readme.txt": "keep"})
+        self.assertEqual(
+            self.run_batch(Pattern("a", "^sample$", 2, (), "zip")), 0,
+            self.log.getvalue(),
+        )
+        self.assertEqual((self.output / "sample/inner/file.txt").read_text(), "data")
+        self.assertEqual((self.output / "sample/readme.txt").read_text(), "keep")
+
+    def test_nested_normalization_collision_keeps_original(self):
+        inner = self.zip("inner.zip", {"file.txt": "data"})
+        contents = inner.read_bytes()
+        inner.unlink()
+        archive = self.zip("sample.zip", {"inner.payload": contents, "inner.zip": contents})
+        self.assertEqual(self.run_batch(Pattern("a", "^sample$", 2, (), "zip")), 1)
+        self.assertTrue(archive.exists())
+        self.assertFalse(list(self.output.iterdir()))
+
     def test_missing_split_volume_retains_all_remaining(self):
         data = self.root / "data.bin"
         data.write_bytes(bytes(range(256)) * 16)
@@ -358,7 +459,7 @@ class IntegrationTests(unittest.TestCase):
         asyncio.run(run_7z(SEVEN_ZIP, ["a", "-mx=0", "-v1k", str(archive), str(data)]))
         (self.source / "sample.7z.002").unlink()
         remaining = set(self.source.iterdir())
-        self.assertEqual(self.run_batch(Pattern("abc", r"^sample\.7z\.\d{3}$", 1, (), "7z")), 1)
+        self.assertEqual(self.run_batch(Pattern("abc", r"^sample$", 1, (), "7z")), 1)
         self.assertEqual(set(self.source.iterdir()), remaining)
 
     def test_no_password_does_not_hang(self):
@@ -453,15 +554,15 @@ class IntegrationTests(unittest.TestCase):
         self.assertRegex(pattern.uid, "^[a-f0-9]{8}$")
         self.assertEqual(pattern.password(2), "secret")
 
-    def test_guided_add_without_type(self):
+    def test_guided_add_saves_required_type(self):
         config = self.root / "pattern.yaml"
         with patch("src.cli.Console", return_value=Console(file=io.StringIO())), patch(
-            "src.cli.Prompt.ask", side_effect=[r"^sample\.zip$", "auto", ""]
+            "src.cli.Prompt.ask", side_effect=[r"^sample$", "zip", ""]
         ), patch("src.cli.IntPrompt.ask", return_value=1):
             self.assertEqual(main(["--config", str(config), "--add"]), 0)
             self.assertEqual(main(["--config", str(config), "--list"]), 0)
-        self.assertIsNone(load_patterns(config)[0].type)
-        self.assertNotIn("type:", config.read_text())
+        self.assertEqual(load_patterns(config)[0].type, "zip")
+        self.assertIn("type: zip", config.read_text())
 
 
 if __name__ == "__main__":
